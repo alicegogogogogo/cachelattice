@@ -144,11 +144,17 @@ back**:
    compute the same bytes, and the `if (!hasManifest) writeManifest` guard leaves
    the first manifest in place, byte-identical to the second anyway.
 
-`POST /graphs/{id}/verify` turns that argument into an executable check: it
-re-executes every node with cache reads disabled and compares the result against
-what the cache held, by digest and byte by byte. It reports `identical: true`
-with `byte_identical` equal to the node count, or `issues` naming
-`digest_changed`, `bytes_differ` or `cache_unreadable`.
+`POST /graphs/{id}/verify` turns that argument into an executable check. It
+requires a prior successful run, then takes every node key from that reference
+run, reads back the manifest and its blob, re-executes the frozen command in
+memory, and compares the recomputed digest and size with what the cache held.
+Verification is strictly read-only: it never writes a blob, manifest,
+`last_run`, idempotency record or statistic, and it never touches the
+workspace. All nodes matching returns `200` with the `cachelattice/verify/v1`
+summary; a node whose cache cannot be read or address-validated is `409`
+`verification_unavailable`; readable caches whose recomputed bytes differ are
+`422` `reproducibility_mismatch` with every divergence in
+`error.details.mismatches`. Neither error path returns partial results.
 
 One deliberate consequence: an action whose input changed but which recomputes to
 the same bytes still invalidates every downstream node, because a node key folds
@@ -159,7 +165,9 @@ conservative and can only do extra work, never serve a stale artifact.
 
 All bodies are JSON unless stated otherwise, unknown fields are rejected, and
 errors use `{"error":{"code":"<snake_case>","message":"…"}}`: validation `400`,
-missing `404`, conflict `409`.
+missing `404`, conflict and unavailable verification `409`, and an
+unreproducible build `422` (the only error whose envelope adds
+`error.details`).
 
 ### `GET /health`
 
@@ -244,6 +252,44 @@ each node's `resources`; all three are empty objects when nothing is declared.
 hashes the resolved `(action_id, key)` pairs. With `use_cache: false` the answer
 is recomputed while the store is still written, which forces a miss without
 corrupting anything.
+
+### `POST /graphs/{id}/verify`
+
+Body must be empty or exactly `{}`; any other JSON value, a non-object, or an
+unknown field is a `400` `validation_error`. The endpoint neither defines a
+graph nor an action, and it never writes: a graph must already have one
+successful run, and verification leaves every blob, manifest, `last_run`,
+idempotency record, statistic and workspace file exactly as it found them.
+
+Each node key from the most recent successful run locates a manifest and its
+artifact blob; the manifest is address-validated (its frozen command, inputs,
+environment and dependency node keys recompute to the node key) and the blob is
+digest-validated, then the frozen command is re-executed in memory. Repeated
+node keys share one re-execution, but every node appears separately in the
+result. All nodes matching returns `200`:
+
+```json
+{
+  "schema": "cachelattice/verify/v1",
+  "graph_id": "build",
+  "reference_run_key": "921010ee…",
+  "verified": [
+    {"node_id": "bundle", "key": "6bd590cb…", "digest": "sha256:1e6ed65d…", "size": 6}
+  ]
+}
+```
+
+`verified` is sorted by `node_id`; `digest` is `sha256:<64 lowercase hex>` and
+`size` is the byte count. An unknown graph is `404` `not_found`; a graph with no
+successful run, a node whose manifest or blob is missing, or a manifest/blob
+that fails address validation is `409` `verification_unavailable`, with the
+reason (and `node_id` when one is involved) in `error.message`. When every
+cache entry is readable but any recomputed digest or size differs, the answer is
+`422` `reproducibility_mismatch` and `error.details.mismatches`, sorted by
+`node_id`, names `node_id`, `expected_digest`, `expected_size`,
+`actual_digest` and `actual_size` for each divergence. Neither error carries
+partial verification results. With the workspace and cache unchanged, repeated
+calls return the same summary.
 
 ### `GET /stats`
 

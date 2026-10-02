@@ -2,7 +2,14 @@ import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { canonicalJson, digestOf, sha256Text, assertDigest } from './canonical.js';
-import { ConflictError, NotFoundError, ValidationError } from './errors.js';
+import {
+  CachelatticeError,
+  ConflictError,
+  NotFoundError,
+  ReproducibilityMismatchError,
+  ValidationError,
+  VerificationUnavailableError,
+} from './errors.js';
 import { commandSources, executeArtifact, normalizeCommand } from './executor.js';
 import {
   actionIdOf,
@@ -20,6 +27,7 @@ import { ObjectStore } from './store.js';
 
 export const MANIFEST_SCHEMA = 'cachelattice/manifest/v1';
 export const RUN_SCHEMA = 'cachelattice/run/v1';
+const VERIFY_SCHEMA = 'cachelattice/verify/v1';
 const STATS_SCHEMA = 'cachelattice/stats/v1';
 
 const GRAPH_FIELDS = ['id', 'nodes', 'concurrency', 'limits'];
@@ -99,6 +107,8 @@ export function dependencyRunKey(dependencies) {
     .join('\n');
   return sha256Text(`cachelattice/dependency-run/v1\n${lines}`);
 }
+
+const byNodeId = (left, right) => (left.node_id < right.node_id ? -1 : left.node_id > right.node_id ? 1 : 0);
 
 // A miss and a hit must produce byte-identical manifests as well as
 // byte-identical artifacts, so the manifest is derived purely from the action
@@ -713,55 +723,115 @@ export class Cachelattice {
 
   // ---------------------------------------------------------------- verify
 
-  // Re-executes the graph with cache reads disabled and compares every node with
-  // what the cache already holds, by digest and byte by byte. A cache entry that
-  // cannot even be read back (missing blob, tampered bytes) is reported as an
-  // issue rather than raised, because that is exactly what verification is for.
+  // Reproducible-build verification against the most recent successful run.
+  // Unlike runGraph({use_cache:false}) this path is strictly read-only: it
+  // never writes a blob or manifest, never moves last_run or idempotency
+  // records, never bumps a counter, and never touches the workspace. Each node
+  // key from the reference run locates a manifest and its blob, the manifest is
+  // address-checked (its frozen fields must recompute to the node key) and the
+  // blob digest-checked, then the frozen command is re-executed in memory and
+  // its digest and size are compared with what the cache holds.
   async verifyGraph(graphId) {
     await this.loading;
-    const baseline = this.runs.get(graphId);
-    if (!baseline) throw new NotFoundError(`graph ${graphId} has no completed run to verify`);
-    const cached = new Map();
-    const issues = [];
-    for (const node of baseline.nodes) {
-      try {
-        const entry = await this.store.readArtifact(node.key);
-        cached.set(node.id, { digest: node.digest, buffer: entry.buffer });
-      } catch (error) {
-        issues.push({ id: node.id, issue: 'cache_unreadable', detail: error.message });
-      }
+    const graph = this.graphs.get(graphId);
+    if (!graph) throw new NotFoundError(`graph ${graphId} is not registered`);
+    // A run record exists only for a run that completed every node, so this is
+    // exactly "the graph has one successful run".
+    const reference = this.runs.get(graphId);
+    if (!reference) {
+      throw new VerificationUnavailableError(
+        `graph ${graphId} has no successful run to verify; run it before verifying`,
+      );
     }
-    const rerun = await this.runGraph(graphId, { useCache: false });
-    let byteIdentical = 0;
-    for (const node of rerun.nodes) {
-      const before = cached.get(node.id);
-      if (!before) {
-        if (!issues.some((issue) => issue.id === node.id)) {
-          issues.push({ id: node.id, issue: 'missing_from_baseline' });
+
+    // Each distinct node key is located and re-executed once; two nodes that
+    // share one key (identical definitions) still each get their own verified
+    // entry afterwards.
+    const reexecuted = new Map();
+    const unavailable = (nodeId, reason) => {
+      throw new VerificationUnavailableError(
+        `verification of graph ${graphId} is unavailable for node ${nodeId}: ${reason}`,
+      );
+    };
+
+    for (const node of reference.nodes) {
+      if (reexecuted.has(node.key)) continue;
+      let entry;
+      try {
+        entry = await this.store.readArtifact(node.key);
+      } catch (error) {
+        if (error instanceof NotFoundError || error instanceof ValidationError) {
+          unavailable(node.id, error.message);
         }
-        continue;
+        throw error;
       }
-      if (before.digest !== node.digest) {
-        issues.push({ id: node.id, issue: 'digest_changed', cached: before.digest, recomputed: node.digest });
-        continue;
+      const { manifest, buffer } = entry;
+
+      // The run record and the manifest must describe the same artifact.
+      if (manifest.digest !== node.digest || manifest.size !== node.size) {
+        unavailable(
+          node.id,
+          `the cache manifest for key ${node.key} does not describe the artifact recorded by run ${reference.run_key}`,
+        );
       }
-      let after;
+
+      // Address validation: the frozen command, inputs, environment and
+      // dependency node keys must recompute to exactly the node key that named
+      // this manifest, and the stored bytes must be the bytes it names.
+      const recomputedKey = nodeKeyOf(
+        actionKey({ command: manifest.command, inputs: manifest.inputs, env: manifest.env }),
+        manifest.dependencies.map((dependency) => dependency.key),
+      );
+      if (recomputedKey !== manifest.key) {
+        unavailable(node.id, `cache manifest for key ${node.key} fails address validation`);
+      }
+      if (digestOf(buffer) !== manifest.digest) {
+        unavailable(node.id, `cache blob for key ${node.key} fails digest validation`);
+      }
+
+      let recomputed;
       try {
-        after = await this.store.readArtifact(node.key);
+        recomputed = await executeArtifact({
+          command: manifest.command,
+          inputs: manifest.inputs,
+          env: manifest.env,
+          dependencies: manifest.dependencies,
+          workspace: this.workspace,
+        });
       } catch (error) {
-        issues.push({ id: node.id, issue: 'cache_unreadable', detail: error.message });
-        continue;
+        if (error instanceof CachelatticeError) unavailable(node.id, error.message);
+        throw error;
       }
-      if (before.buffer.equals(after.buffer)) byteIdentical += 1;
-      else issues.push({ id: node.id, issue: 'bytes_differ', digest: node.digest });
+      reexecuted.set(node.key, { digest: digestOf(recomputed), size: recomputed.length });
     }
+
+    const mismatches = [];
+    const verified = [];
+    for (const node of reference.nodes) {
+      const expected = { digest: node.digest, size: node.size };
+      const actual = reexecuted.get(node.key);
+      if (actual.digest !== expected.digest || actual.size !== expected.size) {
+        mismatches.push({
+          node_id: node.id,
+          expected_digest: expected.digest,
+          expected_size: expected.size,
+          actual_digest: actual.digest,
+          actual_size: actual.size,
+        });
+      } else {
+        verified.push({ node_id: node.id, key: node.key, digest: expected.digest, size: expected.size });
+      }
+    }
+    verified.sort(byNodeId);
+    mismatches.sort(byNodeId);
+
+    if (mismatches.length > 0) throw new ReproducibilityMismatchError(mismatches);
+
     return {
+      schema: VERIFY_SCHEMA,
       graph_id: graphId,
-      run_key: rerun.run_key,
-      identical: issues.length === 0,
-      comparisons: rerun.nodes.length,
-      byte_identical: byteIdentical,
-      issues,
+      reference_run_key: reference.run_key,
+      verified,
     };
   }
 

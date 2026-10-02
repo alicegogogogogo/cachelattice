@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, afterEach, before, beforeEach, describe, test } from 'node:test';
@@ -329,20 +329,241 @@ describe('cache hits and misses', () => {
     assert.deepEqual({ cache: recomputed.nodes[0].cache, digest: recomputed.nodes[0].digest }, { cache: 'miss', digest: first.nodes[0].digest });
   });
 
-  test('verify reports byte identical artifacts, or corruption', async () => {
+  test('verify reports the frozen digest and size of every node, sorted by node id', async () => {
+    const source = await service.putAction({
+      name: 'source',
+      command: { kind: 'copy-file', source: 'src/app.txt' },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    await service.putAction({
+      name: 'down',
+      command: { kind: 'write-file', content: 'DOWN' },
+      inputs: [hashIn('in.txt', source.key)],
+      env: [],
+      depends_on: ['source'],
+    });
+    await service.putGraph('vg', {
+      id: 'vg',
+      nodes: [
+        { id: 'a', action: 'source' },
+        { id: 'b', action: 'down', needs: ['a'] },
+      ],
+    });
+    const run = await service.runGraph('vg');
+    const result = await service.verifyGraph('vg');
+    assert.equal(result.schema, 'cachelattice/verify/v1');
+    assert.equal(result.graph_id, 'vg');
+    assert.equal(result.reference_run_key, run.run_key);
+    assert.deepEqual(result.verified.map((node) => node.node_id), ['a', 'b']);
+    for (const [index, node] of result.verified.entries()) {
+      const expected = run.nodes[index];
+      assert.deepEqual({ ...node }, {
+        node_id: expected.id,
+        key: expected.key,
+        digest: expected.digest,
+        size: expected.size,
+      });
+      assert.match(node.digest, /^sha256:[0-9a-f]{64}$/);
+      assert.ok(Number.isInteger(node.size));
+    }
+  });
+
+  test('verify lists identical-content nodes separately and is deterministic across calls', async () => {
+    await registerFilter();
+    await service.putGraph('shared', {
+      id: 'shared',
+      nodes: [
+        { id: 'a', action: 'filter' },
+        { id: 'b', action: 'filter' },
+      ],
+    });
+    const run = await service.runGraph('shared');
+    const first = await service.verifyGraph('shared');
+    const second = await service.verifyGraph('shared');
+    assert.deepEqual(second, first);
+    assert.deepEqual(first.verified.map((node) => node.node_id), ['a', 'b']);
+    assert.equal(first.verified[0].key, run.nodes[0].key);
+    assert.equal(first.verified[1].key, first.verified[0].key, 'one shared key, two verified nodes');
+  });
+
+  test('verify uses the frozen manifest, not the current action registration', async () => {
     await registerFilter();
     const run = await runOne();
-    const clean = await service.verifyGraph('build');
-    assert.deepEqual(
-      { identical: clean.identical, comparisons: clean.comparisons, bytes: clean.byte_identical, issues: clean.issues },
-      { identical: true, comparisons: 1, bytes: 1, issues: [] },
+    // Replace the action after the run without running again: verification must
+    // follow the manifest's frozen command, not plan() against the new action.
+    await service.putAction(
+      { name: 'filter', command: filterCmd({ pattern: 'z' }), inputs: [fileIn('src/app.txt')], env: ['LANG'] },
+      { refresh: true },
     );
-    await writeFile(service.store.blobPath(run.nodes[0].digest.slice('sha256:'.length)), 'tampered');
-    const tampered = await service.verifyGraph('build');
-    assert.deepEqual(
-      { identical: tampered.identical, bytes: tampered.byte_identical, issue: tampered.issues[0].issue },
-      { identical: false, bytes: 0, issue: 'cache_unreadable' },
+    const result = await service.verifyGraph('build');
+    assert.equal(result.verified[0].digest, run.nodes[0].digest);
+  });
+
+  test('verify is 404 for an unknown graph and 409 when no successful run exists', async () => {
+    await assert.rejects(
+      service.verifyGraph('absent'),
+      (error) => error.status === 404 && error.code === 'not_found',
     );
+    await registerFilter();
+    await service.putGraph('idle', { id: 'idle', nodes: [{ id: 'a', action: 'filter' }] });
+    await assert.rejects(
+      service.verifyGraph('idle'),
+      (error) =>
+        error.status === 409 &&
+        error.code === 'verification_unavailable' &&
+        /no successful run/.test(error.message),
+    );
+  });
+
+  test('missing or tampered manifests and blobs make verification unavailable at the node', async () => {
+    const freshService = async (label) => {
+      const local = new Cachelattice({
+        dataDirectory: path.join(root, `data-${label}`),
+        workspace,
+        ambientEnv: AMBIENT,
+      });
+      await local.loading;
+      await local.putAction({ name: 'filter', command: filterCmd(), inputs: [fileIn('src/app.txt')], env: ['LANG'] });
+      await local.putGraph('build', { id: 'build', nodes: [{ id: 'a', action: 'filter' }] });
+      return { local, run: await local.runGraph('build') };
+    };
+    const assertUnavailable = async (label, tamper, reason) => {
+      const { local, run } = await freshService(label);
+      await tamper(local, run);
+      await assert.rejects(
+        local.verifyGraph('build'),
+        (error) =>
+          error.status === 409 &&
+          error.code === 'verification_unavailable' &&
+          /node a/.test(error.message) &&
+          reason.test(error.message),
+      );
+    };
+    await assertUnavailable(
+      'no-manifest',
+      (local, run) => local.store.deleteManifest(run.nodes[0].key),
+      /key/,
+    );
+    await assertUnavailable(
+      'no-blob',
+      (local, run) => local.store.deleteBlob(run.nodes[0].digest.slice('sha256:'.length)),
+      /missing|not match/,
+    );
+    await assertUnavailable(
+      'bad-blob',
+      (local, run) =>
+        writeFile(local.store.blobPath(run.nodes[0].digest.slice('sha256:'.length)), 'tampered'),
+      /not match/,
+    );
+    await assertUnavailable(
+      'forged-manifest',
+      async (local, run) => {
+        const key = run.nodes[0].key;
+        const manifest = JSON.parse(await readFile(local.store.manifestPath(key), 'utf8'));
+        manifest.command = { kind: 'write-file', content: 'forged' };
+        await writeFile(local.store.manifestPath(key), JSON.stringify(manifest));
+      },
+      /address validation/,
+    );
+  });
+
+  test('recomputed bytes that differ are a sorted 422 mismatch report with no partial result', async () => {
+    const source = await service.putAction({
+      name: 'source',
+      command: { kind: 'copy-file', source: 'src/app.txt' },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    await service.putAction({
+      name: 'down',
+      command: { kind: 'write-file', content: 'DOWN' },
+      inputs: [hashIn('in.txt', source.key)],
+      env: [],
+      depends_on: ['source'],
+    });
+    await service.putGraph('vg', {
+      id: 'vg',
+      nodes: [
+        { id: 'a', action: 'source' },
+        { id: 'b', action: 'down', needs: ['a'] },
+      ],
+    });
+    const run = await service.runGraph('vg');
+    const changed = Buffer.from('alpha\nDELTA\n');
+    await writeFile(path.join(workspace, 'src', 'app.txt'), changed);
+
+    await assert.rejects(
+      service.verifyGraph('vg'),
+      (error) => {
+        assert.equal(error.status, 422);
+        assert.equal(error.code, 'reproducibility_mismatch');
+        assert.deepEqual(Object.keys(error.details), ['mismatches']);
+        assert.equal(error.details.mismatches.length, 1, 'the unchanged downstream node is not a mismatch');
+        assert.deepEqual({ ...error.details.mismatches[0] }, {
+          node_id: 'a',
+          expected_digest: run.nodes[0].digest,
+          expected_size: run.nodes[0].size,
+          actual_digest: digestOf(changed),
+          actual_size: changed.length,
+        });
+        assert.ok(!('verified' in error), 'a mismatch never returns partial verification results');
+        return true;
+      },
+    );
+  });
+
+  test('verification writes nothing: stats, last_run, cache entries and workspace are unchanged', async () => {
+    const source = await service.putAction({
+      name: 'source',
+      command: { kind: 'copy-file', source: 'src/app.txt' },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    await service.putAction({
+      name: 'down',
+      command: { kind: 'write-file', content: 'DOWN' },
+      inputs: [hashIn('in.txt', source.key)],
+      env: [],
+      depends_on: ['source'],
+    });
+    await service.putGraph('ro', {
+      id: 'ro',
+      nodes: [
+        { id: 'a', action: 'source' },
+        { id: 'b', action: 'down', needs: ['a'] },
+      ],
+    });
+    const run = await service.runGraph('ro');
+
+    const beforeStats = await service.stats();
+    const beforeEntries = await service.cacheEntries(100000);
+    const beforeBlobs = await service.store.listBlobDigests();
+    const beforeRun = await service.store.readMeta('runs/ro.json');
+    const idempotencyDir = service.store.metaPath('idempotency');
+    const beforeIdempotency = await readdir(idempotencyDir).catch((error) =>
+      error.code === 'ENOENT' ? [] : Promise.reject(error),
+    );
+    const workspaceDigest = digestOf(await readFile(path.join(workspace, 'src', 'app.txt')));
+
+    const result = await service.verifyGraph('ro');
+    await service.verifyGraph('ro');
+
+    assert.deepEqual(await service.stats(), beforeStats, 'no counter moves during verification');
+    assert.deepEqual(await service.cacheEntries(100000), beforeEntries, 'no cache entry appears');
+    assert.deepEqual(await service.store.listBlobDigests(), beforeBlobs, 'no blob appears');
+    assert.deepEqual(await service.store.readMeta('runs/ro.json'), beforeRun, 'last_run is untouched');
+    assert.deepEqual(
+      await readdir(idempotencyDir).catch((error) => (error.code === 'ENOENT' ? [] : Promise.reject(error))),
+      beforeIdempotency,
+      'no idempotency record is written',
+    );
+    assert.equal(
+      digestOf(await readFile(path.join(workspace, 'src', 'app.txt'))),
+      workspaceDigest,
+      'the workspace is untouched',
+    );
+    assert.equal(result.reference_run_key, run.run_key);
   });
 
   test('different names sharing one definition share one cache entry', async () => {
@@ -976,10 +1197,76 @@ describe('HTTP contract', () => {
     assert.deepEqual({ hits: state.json.last_run.cache_hits, nodes: state.json.last_run.nodes.length }, { hits: 1, nodes: 1 });
     assert.equal((await call('GET', '/stats')).json.schema, 'cachelattice/stats/v1');
     const verify = await call('POST', '/graphs/build/verify', {});
+    assert.equal(verify.status, 200);
+    assert.equal(verify.json.schema, 'cachelattice/verify/v1');
+    assert.equal(verify.json.graph_id, 'build');
+    assert.equal(verify.json.reference_run_key, hit.json.run_key);
     assert.deepEqual(
-      { identical: verify.json.identical, bytes: verify.json.byte_identical, issues: verify.json.issues },
-      { identical: true, bytes: 1, issues: [] },
+      verify.json.verified.map((node) => ({ ...node })),
+      [{
+        node_id: 'compile',
+        key: miss.json.nodes[0].key,
+        digest: miss.json.nodes[0].digest,
+        size: miss.json.nodes[0].size,
+      }],
     );
+
+    // Repeated verification with the workspace and cache untouched returns the
+    // exact same summary, and an empty body is accepted just like {}.
+    assert.deepEqual((await call('POST', '/graphs/build/verify', {})).json, verify.json);
+    assert.deepEqual((await call('POST', '/graphs/build/verify')).json, verify.json);
+
+    const statsAfterVerify = (await call('GET', '/stats')).json;
+    assert.equal(statsAfterVerify.graph_runs, 2, 'verification neither schedules nor counts a run');
+    assert.equal(statsAfterVerify.cache_misses, 1);
+    assert.equal(statsAfterVerify.artifacts_executed, 1);
+    assert.equal(statsAfterVerify.cache_writes, 1);
+
+    // The request carries no parameters: anything but empty or {} is a 400.
+    for (const badBody of ['not json', '[]', 'null', '42', '"x"', { use_cache: false }, { extra: 1 }]) {
+      const bad = await call('POST', '/graphs/build/verify', badBody);
+      assert.deepEqual(
+        { status: bad.status, code: bad.json.error.code },
+        { status: 400, code: 'validation_error' },
+        `body ${JSON.stringify(badBody)} is rejected`,
+      );
+    }
+
+    const unknown = await call('POST', '/graphs/absent/verify', {});
+    assert.deepEqual({ status: unknown.status, code: unknown.json.error.code }, { status: 404, code: 'not_found' });
+  });
+
+  test('verify is 409 before a successful run and 422 with a sorted mismatch report afterwards', async () => {
+    assert.equal((await call('POST', '/graphs', { id: 'vr', nodes: [{ id: 'a', action: 'filter' }] })).status, 201);
+    const unavailable = await call('POST', '/graphs/vr/verify', {});
+    assert.deepEqual(
+      { status: unavailable.status, code: unavailable.json.error.code },
+      { status: 409, code: 'verification_unavailable' },
+    );
+    assert.match(unavailable.json.error.message, /node|run/);
+    assert.equal(unavailable.json.error.details, undefined);
+
+    const run = await call('POST', '/graphs/vr/run', {});
+    const wsFile = path.join(httpRoot, 'workspace', 'src', 'app.txt');
+    const original = await readFile(wsFile);
+    await writeFile(wsFile, 'alpha\nDELTA\n');
+    try {
+      const mismatch = await call('POST', '/graphs/vr/verify', {});
+      assert.equal(mismatch.status, 422);
+      assert.equal(mismatch.json.error.code, 'reproducibility_mismatch');
+      assert.deepEqual(Object.keys(mismatch.json.error), ['code', 'details', 'message']);
+      assert.deepEqual({ ...mismatch.json.error.details.mismatches[0] }, {
+        node_id: 'a',
+        expected_digest: run.json.nodes[0].digest,
+        expected_size: run.json.nodes[0].size,
+        actual_digest: digestOf(Buffer.from('alpha\n')),
+        actual_size: Buffer.byteLength('alpha\n'),
+      });
+    } finally {
+      await writeFile(wsFile, original);
+    }
+    // With the workspace restored, the same graph verifies cleanly again.
+    assert.equal((await call('POST', '/graphs/vr/verify', {})).status, 200);
   });
 
   test('a remote upload must recompute to the key it claims', async () => {
