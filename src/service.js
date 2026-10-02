@@ -22,13 +22,20 @@ export const MANIFEST_SCHEMA = 'cachelattice/manifest/v1';
 export const RUN_SCHEMA = 'cachelattice/run/v1';
 const STATS_SCHEMA = 'cachelattice/stats/v1';
 
-const GRAPH_FIELDS = ['id', 'nodes', 'concurrency'];
-const NODE_FIELDS = ['id', 'action', 'needs'];
+const GRAPH_FIELDS = ['id', 'nodes', 'concurrency', 'limits'];
+const NODE_FIELDS = ['id', 'action', 'needs', 'resources'];
 const ACTION_FIELDS = ['name', 'command', 'inputs', 'env', 'depends_on'];
 const INPUT_FIELDS = ['kind', 'path', 'digest'];
 const CACHE_ENTRY_FIELDS = ['action_id', 'command', 'inputs', 'env', 'depends_on'];
 
 const HEX_KEY = /^[0-9a-f]{64}$/;
+// A quota name starts with an ASCII letter; the rest are ASCII letters, digits,
+// underscores or hyphens. Length 1..32.
+const RESOURCE_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+const LIMIT_MIN = 1;
+const LIMIT_MAX = 1_000_000;
+const RESOURCE_MIN = 0;
+const RESOURCE_MAX = 1_000_000;
 const ZERO_DIGEST = `sha256:${'0'.repeat(64)}`;
 
 function rejectUnknown(object, allowed, label) {
@@ -41,6 +48,61 @@ function rejectUnknown(object, allowed, label) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Graph-level quotas. Each entry is a resource name mapped to an integer limit
+// in 1..1_000_000; the returned map is a plain object copied so it never aliases
+// request state.
+function normalizeLimits(value) {
+  if (value === undefined) return {};
+  if (!isPlainObject(value)) throw new ValidationError('graph limits must be an object');
+  const limits = {};
+  for (const name of Object.keys(value)) {
+    if (!RESOURCE_NAME.test(name)) {
+      throw new ValidationError(
+        `resource name ${JSON.stringify(name)} must be 1..32 characters starting with an ASCII letter, ` +
+          'followed by ASCII letters, digits, underscores or hyphens',
+      );
+    }
+    const amount = value[name];
+    if (!Number.isInteger(amount) || amount < LIMIT_MIN || amount > LIMIT_MAX) {
+      throw new ValidationError(`graph limit for ${name} must be an integer between 1 and 1000000`);
+    }
+    limits[name] = amount;
+  }
+  return limits;
+}
+
+// A node's reservation request. Each named resource must have a same-named
+// graph quota, and the request must not exceed that quota, so a node can never
+// become unrunnable. Zero and absent entries are equivalent: the node reserves
+// nothing of that resource and it is omitted from the stored map.
+function normalizeResources(value, limits, nodeId) {
+  if (value === undefined) return {};
+  if (!isPlainObject(value)) throw new ValidationError(`node ${nodeId} resources must be an object`);
+  const resources = {};
+  for (const name of Object.keys(value)) {
+    if (!RESOURCE_NAME.test(name)) {
+      throw new ValidationError(
+        `resource name ${JSON.stringify(name)} on node ${nodeId} must be 1..32 characters starting with an ASCII ` +
+          'letter, followed by ASCII letters, digits, underscores or hyphens',
+      );
+    }
+    const amount = value[name];
+    if (!Number.isInteger(amount) || amount < RESOURCE_MIN || amount > RESOURCE_MAX) {
+      throw new ValidationError(`node ${nodeId} resource ${name} must be an integer between 0 and 1000000`);
+    }
+    if (!(name in limits)) {
+      throw new ValidationError(`node ${nodeId} requests resource ${name}, but the graph declares no limit for it`);
+    }
+    if (amount > limits[name]) {
+      throw new ValidationError(
+        `node ${nodeId} requests ${amount} of ${name}, which exceeds the graph limit of ${limits[name]}`,
+      );
+    }
+    if (amount !== 0) resources[name] = amount;
+  }
+  return resources;
 }
 
 function normalizeProducers(value, label) {
@@ -189,7 +251,17 @@ export class Cachelattice {
   }
 
   graphView(graph) {
-    return { id: graph.id, concurrency: graph.concurrency, nodes: graph.nodes };
+    return {
+      id: graph.id,
+      concurrency: graph.concurrency,
+      limits: graph.limits ?? {},
+      nodes: graph.nodes.map((node) => ({
+        id: node.id,
+        action: node.action,
+        needs: node.needs,
+        resources: node.resources ?? {},
+      })),
+    };
   }
 
   // ---------------------------------------------------------------- actions
@@ -325,6 +397,9 @@ export class Cachelattice {
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 64) {
       throw new ValidationError('graph concurrency must be an integer between 1 and 64');
     }
+    // Limits are resolved before the nodes so each node's resources can be
+    // checked against the quota it draws from.
+    const limits = normalizeLimits(body.limits);
 
     const nodes = body.nodes.map((node) => {
       if (!isPlainObject(node)) throw new ValidationError('each graph node must be an object');
@@ -337,7 +412,8 @@ export class Cachelattice {
         throw new ValidationError(`node ${nodeId} lists a dependency twice`);
       }
       for (const dependency of needs) assertName(dependency, `node ${nodeId} dependency`);
-      return { id: nodeId, action, needs: [...needs].sort() };
+      const resources = normalizeResources(node.resources, limits, nodeId);
+      return { id: nodeId, action, needs: [...needs].sort(), resources };
     });
 
     const seen = new Set();
@@ -357,7 +433,7 @@ export class Cachelattice {
       seen.add(node.id);
     }
 
-    const entry = { id, concurrency, nodes };
+    const entry = { id, concurrency, limits, nodes };
     const existed = this.graphs.has(id);
     this.graphs.set(id, entry);
     if (!existed) this.bump('graphs_registered');
@@ -483,6 +559,26 @@ export class Cachelattice {
       state.get(id).node.needs.every((needed) => state.get(needed).status === 'done');
     const readyIds = () => graph.nodes.map((node) => node.id).filter(isReady).sort();
 
+    // Quotas are a graph-local concern: they only decide when a node may start,
+    // and never enter a key, a manifest or an artifact. Reservations are held
+    // for the whole node - execution or cache read alike - and released the
+    // moment it finishes or fails.
+    const limits = graph.limits ?? {};
+    const reserved = {};
+    const peakResources = Object.fromEntries(Object.keys(limits).map((name) => [name, 0]));
+    const fits = (request) =>
+      Object.entries(request).every(([name, amount]) => (reserved[name] ?? 0) + amount <= limits[name]);
+    const adjust = (request, sign) => {
+      for (const [name, amount] of Object.entries(request)) {
+        reserved[name] = (reserved[name] ?? 0) + sign * amount;
+      }
+    };
+    const samplePeak = () => {
+      for (const name of Object.keys(limits)) {
+        peakResources[name] = Math.max(peakResources[name], reserved[name] ?? 0);
+      }
+    };
+
     let hits = 0;
     let misses = 0;
     let inFlight = 0;
@@ -493,11 +589,20 @@ export class Cachelattice {
 
     const results = [];
     while (results.length < graph.nodes.length) {
-      // Deterministic dispatch order: lexicographic by node id. Concurrency is
-      // the only source of timing freedom and never changes an artifact.
-      while (inFlight < graph.concurrency && readyIds().length > 0) {
-        const entry = state.get(readyIds()[0]);
+      // Deterministic dispatch order: lexicographic by node id. Candidates are
+      // scanned in that order, but a candidate whose request does not currently
+      // fit is skipped in favour of later, smaller ready nodes, so a heavy node
+      // at the front cannot head-of-line-block the run. Concurrency is the only
+      // other gate and never changes an artifact.
+      for (const id of readyIds()) {
+        if (inFlight >= graph.concurrency) break;
+        const entry = state.get(id);
+        const request = entry.node.resources ?? {};
+        if (!fits(request)) continue;
+        adjust(request, +1);
+        samplePeak();
         entry.status = 'running';
+        entry.resources = request;
         inFlight += 1;
         peakParallel = Math.max(peakParallel, inFlight);
         const dependencies = entry.node.needs.map((needed) => {
@@ -517,12 +622,14 @@ export class Cachelattice {
             entry.error = error;
           })
           .finally(() => {
+            adjust(entry.resources ?? {}, -1);
             inFlight -= 1;
           });
       }
       const running = [...state.values()].filter((entry) => entry.status === 'running');
       if (running.length === 0) {
-        // A failed node must surface as a failed request, never as a hang.
+        // A failed node must surface as a failed request, never as a hang; its
+        // successors never become ready (a failed dependency is never `done`).
         const failed = [...state.values()].find((entry) => entry.status === 'failed');
         if (failed) throw failed.error;
         if (results.length < graph.nodes.length) {
@@ -542,6 +649,7 @@ export class Cachelattice {
         size: result.size,
         cache: result.cache,
         dependencies: result.dependencies,
+        resources: planned.get(result.id).node.resources ?? {},
       }))
       .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
 
@@ -557,6 +665,8 @@ export class Cachelattice {
       cache_hits: hits,
       cache_misses: misses,
       stale_nodes: stale,
+      resource_limits: limits,
+      peak_resources: peakResources,
       nodes,
     };
     this.runs.set(graphId, record);
@@ -573,6 +683,8 @@ export class Cachelattice {
       cache_misses: misses,
       peak_parallel: peakParallel,
       stale_nodes: stale,
+      resource_limits: limits,
+      peak_resources: peakResources,
       nodes,
     };
   }

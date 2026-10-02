@@ -444,6 +444,177 @@ describe('cache hits and misses', () => {
   });
 });
 
+describe('shared resource quotas', () => {
+  const writeAction = (name, content = name) =>
+    service.putAction({
+      name,
+      command: { kind: 'write-file', content },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+
+  test('limits and resources are validated and a rejected PUT leaves the stored graph', async () => {
+    await writeAction('w');
+    const node = (resources) => ({ id: 'a', action: 'w', ...(resources === undefined ? {} : { resources }) });
+    const reject = async (graph, label) => {
+      await assert.rejects(
+        () => service.putGraph('bad', { id: 'bad', ...graph }),
+        (error) => error.code === 'validation_error',
+        label,
+      );
+    };
+    for (const limits of [[], 'x', null, { cpu: 0 }, { cpu: 1_000_001 }, { cpu: 2.5 }, { cpu: '2' }, { '1cpu': 1 },
+      { 'a b': 1 }, { 'a.b': 1 }, { [ 'x'.repeat(33) ]: 1 }]) {
+      await reject({ nodes: [node()], limits }, JSON.stringify(limits));
+    }
+    for (const resources of [[], null, { cpu: -1 }, { cpu: 1_000_001 }, { cpu: 1.5 }, { cpu: '1' },
+      { '1cpu': 1 }, { [ 'y'.repeat(33) ]: 1 }]) {
+      await reject({ nodes: [node(resources)], limits: { cpu: 2 } }, JSON.stringify(resources));
+    }
+    await reject({ nodes: [node({ gpu: 1 })], limits: { cpu: 1 } }, 'request without a quota');
+    await reject({ nodes: [node({ cpu: 2 })], limits: { cpu: 1 } }, 'request above the quota');
+    await reject({ nodes: [node()], limits: { cpu: 1 }, resources: {} }, 'graph-level resources field');
+    await reject({ nodes: [{ id: 'a', action: 'w', limits: { cpu: 1 } }] }, 'node-level limits field');
+
+    await service.putGraph('keep', { id: 'keep', nodes: [node()] });
+    await assert.rejects(
+      service.putGraph('keep', { id: 'keep', nodes: [node({ cpu: 1 })], limits: {} }),
+      /declares no limit/,
+    );
+    const unchanged = await service.getGraph('keep');
+    assert.deepEqual(unchanged.limits, {});
+    assert.deepEqual(unchanged.nodes[0].resources, {});
+  });
+
+  test('graphs echo limits and per-node resources, defaulting to empty objects', async () => {
+    await writeAction('w');
+    const view = await service.putGraph('q', {
+      id: 'q',
+      concurrency: 3,
+      limits: { cpu: 1, mem: 4 },
+      nodes: [
+        { id: 'a', action: 'w', resources: { cpu: 1, mem: 2 } },
+        { id: 'b', action: 'w', resources: { cpu: 0 } },
+        { id: 'c', action: 'w' },
+      ],
+    });
+    assert.deepEqual(view.limits, { cpu: 1, mem: 4 });
+    assert.deepEqual(view.nodes.map((node) => node.resources), [{ cpu: 1, mem: 2 }, {}, {}]);
+    const fetched = await service.getGraph('q');
+    assert.equal(fetched.last_run, null);
+    assert.deepEqual(fetched.limits, { cpu: 1, mem: 4 });
+    assert.deepEqual(fetched.nodes.map((node) => node.resources), [{ cpu: 1, mem: 2 }, {}, {}]);
+
+    await service.putGraph('plain', { id: 'plain', nodes: [{ id: 'a', action: 'w' }] });
+    const plain = await service.getGraph('plain');
+    assert.deepEqual(plain.limits, {});
+    assert.deepEqual(plain.nodes[0].resources, {});
+  });
+
+  test('scheduling skips a candidate that does not fit and tracks the simultaneous peak', async () => {
+    // Distinct content so each node is an independent miss (shared definitions
+    // would deliberately share one cache entry).
+    await writeAction('wa', 'alpha');
+    await writeAction('wb', 'beta');
+    await writeAction('wc', 'gamma');
+    await service.putGraph('q', {
+      id: 'q',
+      concurrency: 3,
+      limits: { cpu: 1, mem: 4 },
+      nodes: [
+        { id: 'a', action: 'wa', resources: { cpu: 1, mem: 2 } },
+        { id: 'b', action: 'wb', resources: { mem: 2 } },
+        { id: 'c', action: 'wc', resources: { cpu: 1 } },
+      ],
+    });
+    const first = await service.runGraph('q');
+    assert.deepEqual(first.resource_limits, { cpu: 1, mem: 4 });
+    // a and b reserve together (cpu 1/1, mem 4/4) before either resolves; c only
+    // starts once a cpu slot frees, so it never head-of-line-blocks b.
+    assert.equal(first.peak_parallel, 2);
+    assert.deepEqual(first.peak_resources, { cpu: 1, mem: 4 });
+    assert.deepEqual(first.nodes.map((node) => [node.id, node.resources]), [
+      ['a', { cpu: 1, mem: 2 }],
+      ['b', { mem: 2 }],
+      ['c', { cpu: 1 }],
+    ]);
+    assert.equal(first.cache_misses, 3);
+
+    // A hit reserves with the exact same accounting as a miss.
+    const second = await service.runGraph('q');
+    assert.equal(second.cache_hits, 3);
+    assert.equal(second.peak_parallel, 2);
+    assert.deepEqual(second.peak_resources, { cpu: 1, mem: 4 });
+
+    const plain = await service.putGraph('plain2', { id: 'plain2', nodes: [{ id: 'a', action: 'wa' }] });
+    assert.deepEqual(plain.limits, {});
+    const plainRun = await service.runGraph('plain2');
+    assert.deepEqual(plainRun.resource_limits, {});
+    assert.deepEqual(plainRun.peak_resources, {});
+    assert.deepEqual(plainRun.nodes[0].resources, {});
+  });
+
+  test('resource declarations never move a key, node key or run_key', async () => {
+    const action = await writeAction('shared-w');
+    await service.putGraph('with-quota', {
+      id: 'with-quota',
+      limits: { cpu: 2, mem: 9 },
+      nodes: [{ id: 'a', action: 'shared-w', resources: { cpu: 2, mem: 9 } }],
+    });
+    await service.putGraph('without-quota', {
+      id: 'without-quota',
+      nodes: [{ id: 'a', action: 'shared-w' }],
+    });
+    const quotaRun = await service.runGraph('with-quota');
+    const plainRun = await service.runGraph('without-quota');
+    assert.equal(quotaRun.nodes[0].key, action.key);
+    assert.equal(plainRun.nodes[0].key, action.key);
+    assert.equal(quotaRun.run_key, plainRun.run_key);
+    assert.equal(plainRun.cache_hits, 1, 'the quota-less run hits the same cache entry');
+  });
+
+  test('a failed node releases its reservation and its successors never start', async () => {
+    // boom copies a file that disappears before the run, so the miss fails.
+    const boom = await service.putAction({
+      name: 'boom',
+      command: { kind: 'copy-file', source: 'src/app.txt' },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    const ready = await service.putAction({
+      name: 'ready',
+      command: { kind: 'write-file', content: 'ok' },
+      inputs: [hashIn('seed.bin', hex('e'))],
+      env: [],
+    });
+    // s genuinely consumes boom's artifact, so the graph edge matches depends_on.
+    await service.putAction({
+      name: 'child',
+      command: { kind: 'write-file', content: 'downstream' },
+      inputs: [hashIn('boom.txt', boom.key)],
+      env: [],
+      depends_on: ['boom'],
+    });
+    await service.putGraph('failure', {
+      id: 'failure',
+      concurrency: 2,
+      limits: { cpu: 1 },
+      nodes: [
+        { id: 'p', action: 'boom', resources: { cpu: 1 } },
+        { id: 'r', action: 'ready', resources: { cpu: 1 } },
+        { id: 's', action: 'child', needs: ['p'], resources: { cpu: 1 } },
+      ],
+    });
+    const successorKey = service.plan('failure').get('s').key;
+    await rm(path.join(workspace, 'src', 'app.txt'));
+    await assert.rejects(service.runGraph('failure'), (error) => error.code === 'action_failed');
+    // r is an independent root: it only gets the cpu slot after p releases it,
+    // and s depends on the failed p so it must never run.
+    assert.ok(service.store.hasManifest(ready.key), 'the failed node released its reservation');
+    assert.ok(!service.store.hasManifest(successorKey), 'a successor of a failed node never starts');
+  });
+});
+
 describe('remote cache entries', () => {
   test('an entry is accepted only when its fields recompute to the claimed key', async () => {
     const content = await readFile(path.join(workspace, 'src', 'app.txt'));

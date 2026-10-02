@@ -188,9 +188,10 @@ and `POST /graphs` are idempotent under `Idempotency-Key`.
 {
   "id": "build",
   "concurrency": 2,
+  "limits": {"cpu": 4, "mem": 16},
   "nodes": [
-    {"id": "filter", "action": "filter"},
-    {"id": "bundle", "action": "bundle", "needs": ["filter"]}
+    {"id": "filter", "action": "filter", "resources": {"cpu": 1, "mem": 2}},
+    {"id": "bundle", "action": "bundle", "needs": ["filter"], "resources": {"cpu": 2}}
   ]
 }
 ```
@@ -198,7 +199,18 @@ and `POST /graphs` are idempotent under `Idempotency-Key`.
 `201` with the stored graph. Node ids are unique, actions must be registered, and
 `needs` must name nodes **defined earlier in the array** — a cycle is therefore
 impossible and is reported as a validation error. `concurrency` defaults to `1`
-and must be an integer in `1..64`. `GET /graphs/{id}` adds `last_run` (or `null`).
+and must be an integer in `1..64`. Both `limits` and every node's `resources`
+default to `{}`. A limit value is an integer in `1..1000000`; a resource request
+is an integer in `0..1000000`; resource names are 1..32 characters, start with an
+ASCII letter, and continue with ASCII letters, digits, underscores or hyphens.
+Every requested resource must have a same-named graph limit and must not exceed
+it, or the whole request is a `400 validation_error` and the stored graph is
+left untouched. `GET /graphs/{id}` returns `limits` and each node's `resources`
+and adds `last_run` (or `null`).
+
+Resource quotas only decide **when a node may start**; they are not part of an
+action key, node key, `run_key`, `stale_nodes`, manifest or artifact bytes, and
+quotas are independent per graph.
 
 ### `POST /graphs/{id}/run`
 
@@ -209,21 +221,36 @@ Body `{}` or `{"use_cache": false}`. Every run is scheduled, so each node's
 {
   "cache_hits": 2, "cache_misses": 0, "graph_id": "build", "peak_parallel": 1,
   "plan_reused": true,
+  "resource_limits": {"cpu": 4, "mem": 16},
+  "peak_resources": {"cpu": 2, "mem": 2},
   "nodes": [
     {"action": "bundle", "cache": "hit", "dependencies": [{"action_id": "filter", "key": "e71afcbf…"}],
-     "digest": "sha256:1e6ed65d…", "id": "bundle", "key": "6bd590cb…", "size": 6},
+     "digest": "sha256:1e6ed65d…", "id": "bundle", "key": "6bd590cb…", "size": 6,
+     "resources": {"cpu": 2}},
     {"action": "filter", "cache": "hit", "dependencies": [],
-     "digest": "sha256:4fdbc441…", "id": "filter", "key": "e71afcbf…", "size": 17}
+     "digest": "sha256:4fdbc441…", "id": "filter", "key": "e71afcbf…", "size": 17,
+     "resources": {"cpu": 1, "mem": 2}}
   ],
   "run_key": "921010ee…", "stale_nodes": []
 }
 ```
 
-Nodes are dispatched in lexicographic id order, at most `concurrency` at a time,
-and never before every node they `needs` is `done`. `stale_nodes` lists nodes
-whose key moved since the previous run, and `run_key` hashes the resolved
-`(action_id, key)` pairs. With `use_cache: false` the answer is recomputed while
-the store is still written, which forces a miss without corrupting anything.
+Ready nodes are scanned in lexicographic id order, and a node starts only while
+fewer than `concurrency` nodes are running **and** reserving its `resources`
+would not push any resource above its `limits` value. A candidate whose request
+does not currently fit is skipped and later ready candidates are still
+considered, so a heavy node never blocks lighter ones behind it (no
+head-of-line blocking). The reservation is held for the node's whole work —
+execution or a cache read, hit and miss alike — and released as soon as the node
+finishes or fails. `peak_resources` is the simultaneous-reservation peak; a
+declared resource that was never reserved is reported as `0`, and graphs without
+limits report `resource_limits` and `peak_resources` as `{}`; a node that
+declares nothing reports `resources: {}`. A node whose dependency failed never
+starts. Nodes still never run before every node they `needs` is `done`,
+`stale_nodes` lists nodes whose key moved since the previous run, and `run_key`
+hashes the resolved `(action_id, key)` pairs. With `use_cache: false` the answer
+is recomputed while the store is still written, which forces a miss without
+corrupting anything.
 
 ### `GET /stats`
 

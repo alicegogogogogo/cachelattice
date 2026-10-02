@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -63,7 +64,11 @@ export class ObjectStore {
     const target = this.blobPath(digest);
     await mkdir(path.dirname(target), { recursive: true });
     if (!existsSync(target)) {
-      const temporary = `${target}.tmp-${process.pid}`;
+      // A unique temp name per write: two concurrent misses for the very same
+      // key produce identical bytes and must not race on one temp path. Both
+      // renames target the same content address, so whichever lands first the
+      // result is byte-identical.
+      const temporary = `${target}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
       await writeFile(temporary, buffer);
       await rename(temporary, target);
     }
