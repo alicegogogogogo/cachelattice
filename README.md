@@ -259,6 +259,24 @@ when the entry exists. A peer-supplied entry carries no resolved dependency keys
 so it is reachable as the entry of a root node — exactly the entries a peer can
 hand over without shipping its graph.
 
+### `POST /cache/gc`
+
+Body `{}` or `{"keep": ["<64 hex>", …], "dry_run": true}`; both fields are
+optional, `keep` may be empty and `dry_run` defaults to `false`. The keep set is
+the node keys of every registered graph's `last_run` (a graph that never ran
+contributes nothing) plus the `keep` keys, which are de-duplicated and must each
+name an existing cache entry (`404` otherwise). Every manifest is scanned and
+validated first — an unreadable manifest, a key mismatch, a missing or malformed
+digest, or a missing or tampered blob is a `400` and deletes nothing — then every
+entry outside the keep set is removed: its manifest, the blobs only the removed
+manifests referenced, and orphan blobs.
+
+`200` with `{dry_run, kept_keys, removed_keys, removed_digests, kept_bytes,
+removed_bytes}`; the key and digest arrays are sorted and duplicate-free,
+`kept_bytes` is the total size of the distinct blobs the kept manifests
+reference, and `removed_bytes` the total size of the distinct blobs deleted. A
+dry run reports the same sets and byte counts without deleting anything.
+
 `POST /graphs/{id}/run` also honours `Idempotency-Key`: the first response is
 persisted under `meta/idempotency/` and a repeat with that key returns the stored
 status and body without re-executing anything. Keys are scoped to the request
@@ -270,10 +288,13 @@ target.
 node src/cli.js serve [--host H] [--port P] [--data DIR] [--workspace DIR]
 node src/cli.js run --graph ID [--data DIR] [--workspace DIR] [--out FILE] [--no-cache]
 node src/cli.js stats [--data DIR] [--workspace DIR]
+node src/cli.js gc [--data DIR] [--workspace DIR] [--keep KEY]... [--dry-run]
 ```
 
 `run` prints the same JSON as the HTTP run endpoint, and with `--out FILE` it also
 materializes the last node's artifact. `stats` prints the counters and cached keys.
+`gc` prints the same JSON as `POST /cache/gc`: `--keep KEY` may be repeated to
+retain extra entries and `--dry-run` reports without deleting.
 
 ## Tests
 

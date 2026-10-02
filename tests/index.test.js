@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, afterEach, before, beforeEach, describe, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import { canonicalJson, digestOf } from '../src/canonical.js';
 import { ConflictError, NotFoundError, ValidationError } from '../src/errors.js';
@@ -488,6 +491,220 @@ describe('remote cache entries', () => {
   });
 });
 
+describe('cache garbage collection', () => {
+  // A remote entry is a cache entry no graph's last run points at, which makes
+  // it the natural victim for the default keep set.
+  const seedRemote = async (name, content) => {
+    const action = await service.putAction({
+      name,
+      command: { kind: 'write-file', content },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    await service.cachePut(
+      action.key,
+      {
+        action_id: 'peer',
+        command: { kind: 'write-file', content },
+        inputs: [fileWith('src/app.txt', action.inputs[0].digest)],
+        env: [],
+      },
+      Buffer.from(content),
+    );
+    return { key: action.key, digest: digestOf(Buffer.from(content)), size: Buffer.byteLength(content) };
+  };
+
+  test('last-run keys are kept; remote entries and orphan blobs are collected', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const kept = run.nodes[0];
+    const remote = await seedRemote('remote-one', 'from a peer\n');
+    const orphanContent = Buffer.from('orphan bytes');
+    const orphan = await service.store.writeBlob(orphanContent);
+
+    const report = await service.gc({});
+    assert.deepEqual(report, {
+      dry_run: false,
+      kept_keys: [kept.key],
+      removed_keys: [remote.key],
+      removed_digests: [orphan, remote.digest.slice('sha256:'.length)].sort().map((digest) => `sha256:${digest}`),
+      kept_bytes: kept.size,
+      removed_bytes: remote.size + orphanContent.length,
+    });
+    assert.ok(service.store.hasManifest(kept.key));
+    assert.ok(!service.store.hasManifest(remote.key));
+    assert.ok(!service.store.hasBlob(orphan));
+    assert.ok(!service.store.hasBlob(remote.digest.slice('sha256:'.length)));
+    assert.equal((await service.cacheGet(kept.key)).buffer.toString(), 'alpha\nbeta\ngamma\n');
+    assert.equal((await service.stats()).cache_entries, 1);
+  });
+
+  test('a dry run reports the same sets and deletes nothing', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const remote = await seedRemote('remote-dry', 'dry peer\n');
+    const dry = await service.gc({ dry_run: true });
+    assert.equal(dry.dry_run, true);
+    assert.deepEqual(dry.kept_keys, [run.nodes[0].key]);
+    assert.deepEqual(dry.removed_keys, [remote.key]);
+    assert.equal(dry.kept_bytes, run.nodes[0].size);
+    assert.equal(dry.removed_bytes, remote.size);
+    assert.ok(service.store.hasManifest(remote.key));
+    assert.ok(service.store.hasBlob(remote.digest.slice('sha256:'.length)));
+
+    const collected = await service.gc();
+    assert.deepEqual(collected.removed_keys, [remote.key]);
+    assert.ok(!service.store.hasManifest(remote.key));
+  });
+
+  test('a blob shared with a kept entry survives its collected twin manifest', async () => {
+    const content = 'shared bytes\n';
+    const kept = await service.putAction({
+      name: 'kept',
+      command: { kind: 'write-file', content },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    // Same command and same artifact bytes, but a different input list, so a
+    // different key whose manifest names the very same blob.
+    const twin = await service.putAction({
+      name: 'twin',
+      command: { kind: 'write-file', content },
+      inputs: [fileIn('src/app.txt'), hashIn('seed.bin', hex('e'))],
+      env: [],
+    });
+    assert.notEqual(kept.key, twin.key);
+    await service.putGraph('g', { id: 'g', nodes: [{ id: 'a', action: 'kept' }] });
+    await service.runGraph('g');
+    const fileDigest = twin.inputs.find((input) => input.kind === 'file').digest;
+    await service.cachePut(
+      twin.key,
+      {
+        action_id: 'peer',
+        command: { kind: 'write-file', content },
+        inputs: [fileWith('src/app.txt', fileDigest), hashIn('seed.bin', hex('e'))],
+        env: [],
+      },
+      Buffer.from(content),
+    );
+
+    const report = await service.gc({});
+    assert.deepEqual(report.kept_keys, [kept.key]);
+    assert.deepEqual(report.removed_keys, [twin.key]);
+    assert.deepEqual(report.removed_digests, []);
+    assert.equal(report.kept_bytes, Buffer.byteLength(content));
+    assert.equal(report.removed_bytes, 0);
+    assert.ok(service.store.hasBlob(digestOf(Buffer.from(content)).slice('sha256:'.length)));
+  });
+
+  test('explicit keep keys are deduplicated and order-free; a missing one is a 404', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const remote = await seedRemote('remote-keep', 'keep me\n');
+    const report = await service.gc({ keep: [remote.key, remote.key] });
+    assert.deepEqual(report.kept_keys, [run.nodes[0].key, remote.key].sort());
+    assert.deepEqual(report.removed_keys, []);
+    assert.ok(service.store.hasManifest(remote.key));
+
+    await assert.rejects(service.gc({ keep: [hex('a')] }), (error) => error.code === 'not_found');
+    assert.ok(service.store.hasManifest(remote.key), 'a failed request deletes nothing');
+  });
+
+  test('a graph that never ran contributes no keep keys', async () => {
+    const remote = await seedRemote('remote-norun', 'no run\n');
+    await service.putGraph('never-ran', { id: 'never-ran', nodes: [{ id: 'a', action: 'remote-norun' }] });
+    const report = await service.gc({});
+    assert.deepEqual(report.kept_keys, []);
+    assert.deepEqual(report.removed_keys, [remote.key]);
+  });
+
+  test('bad requests are refused before anything is scanned or deleted', async () => {
+    await registerFilter();
+    await runOne();
+    const remote = await seedRemote('remote-val', 'validate me\n');
+    for (const body of [
+      { keep: 'not-an-array' },
+      { keep: ['nope'] },
+      { keep: [hex('A')] },
+      { dry_run: 'yes' },
+      { keep: [], surprise: 1 },
+    ]) {
+      await assert.rejects(service.gc(body), (error) => error.code === 'validation_error');
+    }
+    await assert.rejects(service.gc(['not', 'an', 'object']), (error) => error.code === 'validation_error');
+    assert.ok(service.store.hasManifest(remote.key));
+  });
+
+  test('a corrupt store fails the scan and nothing is deleted', async () => {
+    await registerFilter();
+    await runOne();
+    const remote = await seedRemote('remote-corrupt', 'corrupt me\n');
+    const badKey = hex('b');
+    const badPath = service.store.manifestPath(badKey);
+    const assertScanFails = async (pattern) => {
+      await assert.rejects(
+        service.gc({}),
+        (error) => error.code === 'validation_error' && pattern.test(error.message),
+      );
+      assert.ok(service.store.hasManifest(remote.key), 'a failed scan deletes nothing');
+    };
+
+    await mkdir(path.dirname(badPath), { recursive: true });
+    await writeFile(badPath, 'this is not json');
+    await assertScanFails(/not valid JSON/);
+
+    await service.store.writeManifest(badKey, { key: hex('c'), digest: ZEROS, size: 1 });
+    await assertScanFails(/claims a different key/);
+
+    await service.store.writeManifest(badKey, { key: badKey, size: 1 });
+    await assertScanFails(/digest/);
+
+    await service.store.writeManifest(badKey, { key: badKey, digest: 'sha256:not-hex', size: 1 });
+    await assertScanFails(/digest/);
+
+    await service.store.writeManifest(badKey, { key: badKey, digest: `sha256:${hex('d')}`, size: 1 });
+    await assertScanFails(/missing from the object store/);
+
+    const digest = await service.store.writeBlob(Buffer.from('real bytes'));
+    await writeFile(service.store.blobPath(digest), 'tampered');
+    await service.store.writeManifest(badKey, { key: badKey, digest: `sha256:${digest}`, size: 10 });
+    await assertScanFails(/does not match its digest/);
+
+    await service.store.deleteManifest(badKey);
+    await service.store.deleteBlob(digest);
+    const clean = await service.gc({});
+    assert.deepEqual(clean.removed_keys, [remote.key]);
+  });
+
+  test('the CLI prints the same report and honours --keep and --dry-run', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const remote = await seedRemote('remote-cli', 'cli peer\n');
+    const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+    const data = path.join(root, 'data');
+    const exec = promisify(execFile);
+
+    const dry = JSON.parse(
+      (await exec(process.execPath, [cli, 'gc', '--data', data, '--keep', remote.key, '--dry-run'])).stdout,
+    );
+    assert.equal(dry.dry_run, true);
+    assert.deepEqual(dry.kept_keys, [run.nodes[0].key, remote.key].sort());
+    assert.deepEqual(dry.removed_keys, []);
+    assert.ok(service.store.hasManifest(remote.key), 'a dry run deletes nothing');
+
+    const done = JSON.parse((await exec(process.execPath, [cli, 'gc', '--data', data])).stdout);
+    assert.equal(done.dry_run, false);
+    assert.deepEqual(done.removed_keys, [remote.key]);
+    assert.ok(!service.store.hasManifest(remote.key));
+
+    await assert.rejects(exec(process.execPath, [cli, 'gc', '--data', data, '--keep', 'nope']), (error) => {
+      assert.equal(error.code, 1);
+      assert.equal(JSON.parse(error.stderr).error.code, 'validation_error');
+      return true;
+    });
+  });
+});
+
 describe('HTTP contract', () => {
   let base;
   let httpRoot;
@@ -603,5 +820,51 @@ describe('HTTP contract', () => {
     assert.equal((await call('GET', `/cache/${acceptedKey}`)).text, 'remote artifact\n');
     assert.equal((await call('PUT', `/cache/${acceptedKey}`, content, upload)).status, 409);
     assert.equal((await call('GET', `/cache/${hex('d')}`)).status, 404);
+  });
+
+  test('POST /cache/gc keeps last-run entries and collects the rest', async () => {
+    const gcAction = { name: 'gc-filter', command: filterCmd(), inputs: [fileIn('src/app.txt')], env: ['LANG'] };
+    assert.equal((await call('POST', '/actions', gcAction)).status, 201);
+    assert.equal((await call('POST', '/graphs', { id: 'gc-build', nodes: [{ id: 'a', action: 'gc-filter' }] })).status, 201);
+    const run = await call('POST', '/graphs/gc-build/run', {});
+    const keptKey = run.json.nodes[0].key;
+
+    const seed = hashIn('seed.bin', hex('e'));
+    const seedBody = { name: 'gc-remote', command: { kind: 'write-file', content: 'gc remote\n' }, inputs: [seed], env: [] };
+    const remoteKey = (await call('POST', '/actions', seedBody)).json.key;
+    const upload = {
+      'content-type': 'application/octet-stream',
+      'x-cache-command': JSON.stringify(seedBody.command),
+      'x-cache-inputs': JSON.stringify([seed]),
+      'x-cache-env': JSON.stringify([]),
+    };
+    assert.equal((await call('PUT', `/cache/${remoteKey}`, Buffer.from('gc remote\n'), upload)).status, 201);
+
+    const dry = await call('POST', '/cache/gc', { dry_run: true });
+    assert.equal(dry.status, 200);
+    assert.equal(dry.json.dry_run, true);
+    assert.ok(dry.json.kept_keys.includes(keptKey));
+    assert.ok(dry.json.removed_keys.includes(remoteKey));
+    assert.equal((await call('GET', `/cache/${remoteKey}`)).status, 200, 'a dry run deletes nothing');
+
+    for (const body of [{ keep: ['nope'] }, { dry_run: 'yes' }, { keep: [], extra: 1 }]) {
+      const rejected = await call('POST', '/cache/gc', body);
+      assert.deepEqual({ status: rejected.status, code: rejected.json.error.code }, { status: 400, code: 'validation_error' });
+    }
+    const missing = await call('POST', '/cache/gc', { keep: [hex('a')] });
+    assert.deepEqual({ status: missing.status, code: missing.json.error.code }, { status: 404, code: 'not_found' });
+    assert.equal((await call('GET', `/cache/${remoteKey}`)).status, 200, 'a failed request deletes nothing');
+
+    const done = await call('POST', '/cache/gc', {});
+    assert.equal(done.status, 200);
+    assert.equal(done.json.dry_run, false);
+    assert.ok(done.json.kept_keys.includes(keptKey));
+    assert.ok(done.json.removed_keys.includes(remoteKey));
+    for (const field of ['kept_keys', 'removed_keys', 'removed_digests']) {
+      assert.deepEqual(done.json[field], [...done.json[field]].sort(), `${field} is sorted`);
+      assert.equal(new Set(done.json[field]).size, done.json[field].length, `${field} has no duplicates`);
+    }
+    assert.equal((await call('GET', `/cache/${remoteKey}`)).status, 404);
+    assert.equal((await call('GET', `/cache/${keptKey}`)).status, 200);
   });
 });

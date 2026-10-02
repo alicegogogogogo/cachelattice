@@ -141,6 +141,34 @@ export class ObjectStore {
     return keys;
   }
 
+  // Every blob digest on disk, sorted. A file not named by a 64-digit lowercase
+  // hex digest is not a cache object and is left alone.
+  async listBlobDigests() {
+    const digests = [];
+    let prefixes;
+    try {
+      prefixes = await readdir(this.blobRoot, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === 'ENOENT') return digests;
+      throw error;
+    }
+    for (const prefix of prefixes.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()) {
+      const files = await readdir(path.join(this.blobRoot, prefix));
+      for (const file of files.sort()) {
+        if (HEX.test(file)) digests.push(file);
+      }
+    }
+    return digests;
+  }
+
+  async deleteManifest(key) {
+    await rm(this.manifestPath(key), { force: true });
+  }
+
+  async deleteBlob(digest) {
+    await rm(this.blobPath(digest), { force: true });
+  }
+
   async writeMeta(name, value) {
     const target = this.metaPath(name);
     await mkdir(path.dirname(target), { recursive: true });

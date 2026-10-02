@@ -1,7 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
-import { canonicalJson, digestOf, sha256Text } from './canonical.js';
+import { canonicalJson, digestOf, sha256Text, assertDigest } from './canonical.js';
 import { ConflictError, NotFoundError, ValidationError } from './errors.js';
 import { commandSources, executeArtifact, normalizeCommand } from './executor.js';
 import {
@@ -767,6 +767,91 @@ export class Cachelattice {
   async cacheEntries(limit = 500) {
     await this.loading;
     return this.store.listKeys(limit);
+  }
+
+  // --------------------------------------------------------------------- gc
+
+  // Cache retention. The keep set is the node keys of every registered graph's
+  // last run plus whatever the caller asked to keep; a graph that never ran
+  // contributes nothing. Every manifest is scanned and validated first, so a
+  // corrupt store fails the whole request before a single object is deleted.
+  // Everything outside the keep set is collected: the manifests, the blobs only
+  // they referenced, and orphan blobs. A dry run reports the exact same sets
+  // and byte counts without deleting anything.
+  async gc(request = {}) {
+    await this.loading;
+    if (!isPlainObject(request)) throw new ValidationError('gc request must be a JSON object');
+    rejectUnknown(request, ['keep', 'dry_run'], 'gc request');
+    const dryRun = request.dry_run === undefined ? false : request.dry_run;
+    if (typeof dryRun !== 'boolean') throw new ValidationError('gc dry_run must be a boolean');
+    const keepRequested = new Set();
+    if (request.keep !== undefined) {
+      if (!Array.isArray(request.keep)) throw new ValidationError('gc keep must be an array of cache keys');
+      for (const key of request.keep) keepRequested.add(assertCacheKey(key));
+    }
+
+    const keep = new Set(keepRequested);
+    for (const run of this.runs.values()) {
+      for (const node of run.nodes) keep.add(node.key);
+    }
+
+    // Validate before anything is deleted: an unreadable manifest, a key
+    // mismatch, a missing or dishonest digest, or a missing or tampered blob
+    // fails the request and leaves the store untouched.
+    const keys = await this.store.listKeys(Number.MAX_SAFE_INTEGER);
+    const manifests = new Map();
+    for (const key of keys) {
+      const manifest = await this.store.readManifest(key);
+      const digest = assertDigest(manifest.digest, `cache manifest for key ${key} digest`);
+      const hexDigest = digest.slice('sha256:'.length);
+      let buffer;
+      try {
+        buffer = await readFile(this.store.blobPath(hexDigest));
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          throw new ValidationError(
+            `cache manifest for key ${key} references a blob that is missing from the object store`,
+          );
+        }
+        throw error;
+      }
+      if (digestOf(buffer) !== digest) {
+        throw new ValidationError(`blob referenced by cache manifest for key ${key} does not match its digest`);
+      }
+      manifests.set(key, hexDigest);
+    }
+
+    for (const key of keepRequested) {
+      if (!manifests.has(key)) throw new NotFoundError(`keep key ${key} does not name a cache entry`);
+    }
+
+    const keptKeys = keys.filter((key) => keep.has(key));
+    const removedKeys = keys.filter((key) => !keep.has(key));
+    const keptDigests = new Set(keptKeys.map((key) => manifests.get(key)));
+
+    const blobSizes = new Map();
+    for (const hexDigest of await this.store.listBlobDigests()) {
+      blobSizes.set(hexDigest, (await stat(this.store.blobPath(hexDigest))).size);
+    }
+    let keptBytes = 0;
+    for (const hexDigest of keptDigests) keptBytes += blobSizes.get(hexDigest);
+    const removedDigests = [...blobSizes.keys()].filter((hexDigest) => !keptDigests.has(hexDigest));
+    let removedBytes = 0;
+    for (const hexDigest of removedDigests) removedBytes += blobSizes.get(hexDigest);
+
+    if (!dryRun) {
+      for (const key of removedKeys) await this.store.deleteManifest(key);
+      for (const hexDigest of removedDigests) await this.store.deleteBlob(hexDigest);
+    }
+
+    return {
+      dry_run: dryRun,
+      kept_keys: keptKeys,
+      removed_keys: removedKeys,
+      removed_digests: removedDigests.map((hexDigest) => `sha256:${hexDigest}`),
+      kept_bytes: keptBytes,
+      removed_bytes: removedBytes,
+    };
   }
 
   // ----------------------------------------------------------- idempotency

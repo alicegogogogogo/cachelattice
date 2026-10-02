@@ -191,6 +191,11 @@ async function route_request(service, request, url, segments, idempotencyKey) {
       body: buffer,
     };
   }
+  if (method === 'POST' && segments.length === 2 && segments[0] === 'cache' && segments[1] === 'gc') {
+    const raw = await readBody(request);
+    const body = raw.length === 0 ? {} : parseJson(raw);
+    return jsonOut(200, await service.gc(body));
+  }
   if ((method === 'PUT' || method === 'POST') && segments.length === 2 && segments[0] === 'cache') {
     const key = assertCacheKey(segments[1]);
     const buffer = await readBody(request);
