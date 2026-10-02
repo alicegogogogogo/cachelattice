@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync } from 'node:fs';
-import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { canonicalJson, digestOf } from './canonical.js';
@@ -52,6 +52,21 @@ export class ObjectStore {
 
   hasBlob(digest) {
     return existsSync(this.blobPath(digest));
+  }
+
+  async readBlob(digest) {
+    const key = assertHex(digest, 'digest');
+    const file = this.blobPath(key);
+    let buffer;
+    try {
+      buffer = await readFile(file);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        throw new NotFoundError(`blob sha256:${key} is missing from the object store`);
+      }
+      throw error;
+    }
+    return buffer;
   }
 
   hasManifest(key) {
@@ -139,6 +154,58 @@ export class ObjectStore {
       }
     }
     return keys;
+  }
+
+  // Lists every manifest key on disk, deriving the key from the file name rather
+  // than its contents, so a manifest whose stored key does not match its name is
+  // still surfaced for garbage collection to validate.
+  async scanManifestKeys() {
+    const keys = [];
+    let prefixes;
+    try {
+      prefixes = await readdir(this.manifestRoot, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === 'ENOENT') return keys;
+      throw error;
+    }
+    for (const prefix of prefixes.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()) {
+      const files = await readdir(path.join(this.manifestRoot, prefix));
+      for (const file of files.sort()) {
+        if (file.endsWith('.json')) keys.push(file.slice(0, -'.json'.length));
+      }
+    }
+    return keys;
+  }
+
+  // Lists every blob digest actually present, paired with its byte size. The
+  // digest comes from the content-addressed name; integrity is checked against
+  // that name during a collection.
+  async scanBlobs() {
+    const blobs = [];
+    let prefixes;
+    try {
+      prefixes = await readdir(this.blobRoot, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === 'ENOENT') return blobs;
+      throw error;
+    }
+    for (const prefix of prefixes.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()) {
+      const files = await readdir(path.join(this.blobRoot, prefix), { withFileTypes: true });
+      for (const file of files.filter((entry) => entry.isFile() && HEX.test(entry.name)).sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+        const info = await stat(path.join(this.blobRoot, prefix, file.name));
+        blobs.push({ digest: file.name, size: info.size });
+      }
+    }
+    return blobs;
+  }
+
+  async deleteManifest(nodeKey) {
+    await rm(this.manifestPath(nodeKey), { force: true });
+  }
+
+  async deleteBlob(digest) {
+    await rm(this.blobPath(assertHex(digest, 'digest')), { force: true });
   }
 
   async writeMeta(name, value) {

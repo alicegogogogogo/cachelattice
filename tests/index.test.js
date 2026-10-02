@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { after, afterEach, before, beforeEach, describe, test } from 'node:test';
 
 import { canonicalJson, digestOf } from '../src/canonical.js';
@@ -11,6 +14,9 @@ import { actionKey, normalizeCacheInputs, normalizeEnv, normalizeInputs, normali
 import { Cachelattice } from '../src/service.js';
 import { createServer } from '../src/server.js';
 import { ObjectStore } from '../src/store.js';
+
+const runCli = promisify(execFile);
+const CLI_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.js');
 
 const AMBIENT = { LANG: 'en_US.UTF-8', CC: 'cc' };
 const ZEROS = `sha256:${'0'.repeat(64)}`;
@@ -488,6 +494,236 @@ describe('remote cache entries', () => {
   });
 });
 
+describe('garbage collection', () => {
+  // Two distinct commands so the two graphs produce distinct keys, digests and
+  // blob sizes: pattern 'a' matches all three lines (18 bytes), 'beta' matches
+  // only "beta" (5 bytes).
+  const seedTwo = async () => {
+    await registerFilter('first');
+    await registerFilter('second', { pattern: 'beta' });
+    await service.putGraph('g1', { id: 'g1', nodes: [{ id: 'a', action: 'first' }] });
+    await service.putGraph('g2', { id: 'g2', nodes: [{ id: 'b', action: 'second' }] });
+    const r1 = await service.runGraph('g1');
+    const r2 = await service.runGraph('g2');
+    return {
+      key1: r1.nodes[0].key,
+      key2: r2.nodes[0].key,
+      digest1: r1.nodes[0].digest,
+      digest2: r2.nodes[0].digest,
+      size1: r1.nodes[0].size,
+      size2: r2.nodes[0].size,
+    };
+  };
+
+  // A valid cache entry with no graph run pinning it, exactly what default
+  // retention must collect.
+  const seedUnpinned = async (name = 'extra') => {
+    const bytes = Buffer.from('unpinned extra\n');
+    const input = hashIn(`${name}.bin`, hex('c'));
+    const action = await service.putAction({
+      name,
+      command: { kind: 'write-file', content: 'unpinned extra\n' },
+      inputs: [input],
+      env: [],
+    });
+    await service.cachePut(
+      action.key,
+      { action_id: 'peer', command: { kind: 'write-file', content: 'unpinned extra\n' }, inputs: [input], env: [] },
+      bytes,
+    );
+    return { action, bytes, digest: digestOf(bytes) };
+  };
+
+  test('keeps last_run keys by default and removes the rest with their blobs', async () => {
+    const seeded = await seedTwo();
+    const extra = await seedUnpinned();
+    const result = await service.collectGarbage({});
+    assert.deepEqual([...result.kept_keys].sort(), [seeded.key1, seeded.key2].sort());
+    assert.deepEqual(result.removed_keys, [extra.action.key]);
+    assert.deepEqual(result.removed_digests, [extra.digest]);
+    assert.equal(result.removed_bytes, extra.bytes.length);
+    assert.equal(service.store.hasManifest(extra.action.key), false);
+    assert.equal(service.store.hasBlob(extra.digest.slice('sha256:'.length)), false);
+  });
+
+  test('sums unique referenced blob bytes and keeps serving retained entries', async () => {
+    const seeded = await seedTwo();
+    const result = await service.collectGarbage({ keep: [] });
+    assert.equal(result.dry_run, false);
+    assert.deepEqual([...result.kept_keys].sort(), [seeded.key1, seeded.key2].sort());
+    assert.deepEqual(result.removed_keys, []);
+    assert.deepEqual(result.removed_digests, []);
+    assert.equal(result.kept_bytes, seeded.size1 + seeded.size2);
+    assert.equal(result.removed_bytes, 0);
+    assert.equal((await service.cacheGet(seeded.key1)).buffer.toString(), 'alpha\nbeta\ngamma\n');
+    assert.equal((await service.cacheGet(seeded.key2)).buffer.toString(), 'beta\n');
+  });
+
+  test('an orphan blob is removed and counted once', async () => {
+    const seeded = await seedTwo();
+    const orphan = Buffer.from('nobody references me\n');
+    const orphanDigest = await service.store.writeBlob(orphan);
+    const result = await service.collectGarbage({});
+    assert.deepEqual(result.removed_digests, [`sha256:${orphanDigest}`]);
+    assert.equal(result.removed_bytes, orphan.length);
+    assert.equal(service.store.hasBlob(orphanDigest), false);
+    assert.equal(service.store.hasBlob(seeded.digest1.slice('sha256:'.length)), true);
+  });
+
+  test('keep pins extra keys; order and repetition are irrelevant', async () => {
+    const seeded = await seedTwo();
+    const extra = await seedUnpinned();
+    const result = await service.collectGarbage({ keep: [extra.action.key, seeded.key1, extra.action.key] });
+    assert.deepEqual([...result.kept_keys].sort(), [seeded.key1, seeded.key2, extra.action.key].sort());
+    assert.deepEqual(result.removed_keys, []);
+    assert.deepEqual(result.removed_digests, []);
+    assert.equal(service.store.hasManifest(extra.action.key), true);
+  });
+
+  test('dry run reports the same sets and bytes but deletes nothing', async () => {
+    const seeded = await seedTwo();
+    const extra = await seedUnpinned();
+    const dry = await service.collectGarbage({ dry_run: true, keep: [] });
+    assert.equal(dry.dry_run, true);
+    assert.deepEqual(dry.removed_keys, [extra.action.key]);
+    assert.equal(dry.removed_bytes, extra.bytes.length);
+    assert.equal(service.store.hasManifest(extra.action.key), true, 'a dry run deletes no manifest');
+    assert.equal(service.store.hasBlob(extra.digest.slice('sha256:'.length)), true, 'a dry run deletes no blob');
+
+    const real = await service.collectGarbage({});
+    assert.equal(real.dry_run, false);
+    assert.deepEqual(real.kept_keys, dry.kept_keys);
+    assert.deepEqual(real.removed_keys, dry.removed_keys);
+    assert.deepEqual(real.removed_digests, dry.removed_digests);
+    assert.equal(real.kept_bytes, dry.kept_bytes);
+    assert.equal(real.removed_bytes, dry.removed_bytes);
+    assert.equal(service.store.hasManifest(extra.action.key), false);
+  });
+
+  test('a graph without a last run contributes no retained key', async () => {
+    const seeded = await seedTwo();
+    const lonely = await registerFilter('lonely', { pattern: 'gamma' });
+    await service.putGraph('never-run', { id: 'never-run', nodes: [{ id: 'z', action: 'lonely' }] });
+    // The entry exists (a standalone run produced it) but no surviving last run pins it.
+    await runOne('lonely', 'lonely-run');
+    service.runs.delete('lonely-run');
+    await service.store.deleteMeta('runs/lonely-run.json');
+    const result = await service.collectGarbage({});
+    assert.ok(result.removed_keys.includes(lonely.key));
+    assert.ok(!result.kept_keys.includes(lonely.key));
+    assert.ok(result.kept_keys.includes(seeded.key1));
+  });
+
+  test('a missing keep key is 404 and deletes nothing', async () => {
+    await seedTwo();
+    const ghost = hex('9');
+    await assert.rejects(
+      service.collectGarbage({ keep: [ghost] }),
+      (error) => error instanceof NotFoundError && new RegExp(ghost).test(error.message),
+    );
+    assert.equal((await service.cacheEntries()).length, 2, 'the aborted collection left both entries');
+  });
+
+  test('illegal keys, bad dry_run, unknown fields and a non-object body are 400', async () => {
+    await seedTwo();
+    await assert.rejects(service.collectGarbage({ keep: ['nope'] }), (e) => e instanceof ValidationError);
+    await assert.rejects(service.collectGarbage({ keep: ['XYZ'] }), (e) => e instanceof ValidationError);
+    await assert.rejects(service.collectGarbage({ keep: 'x' }), (e) => e instanceof ValidationError);
+    await assert.rejects(service.collectGarbage({ keep: [123] }), (e) => e instanceof ValidationError);
+    await assert.rejects(service.collectGarbage({ dry_run: 'yes' }), (e) => e instanceof ValidationError);
+    await assert.rejects(service.collectGarbage({ surprise: 1 }), /unknown field: surprise/);
+    await assert.rejects(service.collectGarbage(null), (e) => e instanceof ValidationError);
+    assert.equal((await service.cacheEntries()).length, 2, 'failed collections delete nothing');
+  });
+
+  test('every unsound manifest or blob aborts with 400 before any deletion', async () => {
+    const seeded = await seedTwo();
+    const m1 = (await service.cacheGet(seeded.key1)).manifest;
+    const digest1Hex = seeded.digest1.slice('sha256:'.length);
+    const digest2Hex = seeded.digest2.slice('sha256:'.length);
+    const expectAbort = async () => {
+      await assert.rejects(service.collectGarbage({}), (e) => e instanceof ValidationError);
+      assert.equal(service.store.hasManifest(seeded.key1), true);
+      assert.equal(service.store.hasManifest(seeded.key2), true);
+      assert.equal(service.store.hasBlob(digest2Hex), true, 'a failed scan deletes no objects');
+    };
+
+    // Invalid manifest JSON.
+    await writeFile(service.store.manifestPath(seeded.key1), '{not json\n');
+    await expectAbort();
+
+    // Manifest whose stored key does not match its file name.
+    await service.store.writeManifest(seeded.key1, { ...m1, key: seeded.key2 });
+    await expectAbort();
+
+    // A missing digest value and an illegally shaped digest both fail validation.
+    const { digest: omitted, ...withoutDigest } = m1;
+    await writeFile(service.store.manifestPath(seeded.key1), `${canonicalJson(withoutDigest)}\n`);
+    await expectAbort();
+    await service.store.writeManifest(seeded.key1, { ...m1, digest: 'sha256:zz' });
+    await expectAbort();
+
+    // A well-formed digest naming a blob that is not on disk.
+    await service.store.writeManifest(seeded.key1, { ...m1, digest: `sha256:${hex('d')}` });
+    await expectAbort();
+
+    // A present blob whose bytes do not hash to the claimed digest.
+    await writeFile(service.store.blobPath(digest1Hex), 'wrong bytes');
+    await service.store.writeManifest(seeded.key1, { ...m1, digest: seeded.digest1 });
+    await expectAbort();
+  });
+
+  test('gc leaves cache reads, stats, runs and verification working', async () => {
+    const seeded = await seedTwo();
+    await service.collectGarbage({});
+    assert.equal((await service.cacheGet(seeded.key1)).manifest.digest, seeded.digest1);
+    const run = await service.runGraph('g1');
+    assert.equal(run.cache_hits, 1);
+    const verify = await service.verifyGraph('g1');
+    assert.equal(verify.identical, true);
+    assert.equal((await service.stats()).cache_entries, 2);
+  });
+});
+
+describe('gc CLI', () => {
+  test('gc prints the same JSON and honors --keep and --dry-run', async () => {
+    const dataDir = path.join(root, 'cli-data');
+    const local = new Cachelattice({ dataDirectory: dataDir, workspace, ambientEnv: AMBIENT });
+    await local.loading;
+    const action = await local.putAction({
+      name: 'cli-filter',
+      command: filterCmd(),
+      inputs: [fileIn('src/app.txt')],
+      env: ['LANG'],
+    });
+    await local.putGraph('b', { id: 'b', nodes: [{ id: 'n', action: 'cli-filter' }] });
+    await local.runGraph('b');
+
+    const dry = await runCli(process.execPath, [CLI_PATH, 'gc', '--data', dataDir, '--dry-run']);
+    assert.deepEqual(JSON.parse(dry.stdout), {
+      dry_run: true,
+      kept_keys: [action.key],
+      removed_keys: [],
+      removed_digests: [],
+      kept_bytes: 'alpha\nbeta\ngamma\n'.length,
+      removed_bytes: 0,
+    });
+    // The dry run removed nothing, so the entry is still there.
+    const repeated = await runCli(process.execPath, [
+      CLI_PATH,
+      'gc',
+      '--data',
+      dataDir,
+      '--keep',
+      action.key,
+    ]);
+    const repeatedJson = JSON.parse(repeated.stdout);
+    assert.equal(repeatedJson.dry_run, false);
+    assert.deepEqual(repeatedJson.kept_keys, [action.key]);
+    assert.deepEqual(repeatedJson.removed_keys, []);
+  });
+});
+
 describe('HTTP contract', () => {
   let base;
   let httpRoot;
@@ -603,5 +839,36 @@ describe('HTTP contract', () => {
     assert.equal((await call('GET', `/cache/${acceptedKey}`)).text, 'remote artifact\n');
     assert.equal((await call('PUT', `/cache/${acceptedKey}`, content, upload)).status, 409);
     assert.equal((await call('GET', `/cache/${hex('d')}`)).status, 404);
+  });
+
+  test('POST /cache/gc retains last run keys, dry runs, collects and reports errors', async () => {
+    const graph = await call('GET', '/graphs/build');
+    const pinned = graph.json.last_run.nodes[0].key;
+    const before = await call('GET', '/cache');
+    const removable = before.json.entries.filter((key) => key !== pinned);
+    assert.equal(removable.length, 1, 'the remote-uploaded entry is pinned by no graph run');
+
+    const dry = await call('POST', '/cache/gc', { dry_run: true });
+    assert.equal(dry.status, 200);
+    assert.equal(dry.json.dry_run, true);
+    assert.deepEqual(dry.json.kept_keys, [pinned]);
+    assert.deepEqual(dry.json.removed_keys, removable);
+    assert.equal(dry.json.removed_bytes, 'remote artifact\n'.length);
+    // A dry run leaves every object in place.
+    assert.deepEqual((await call('GET', '/cache')).json.entries, before.json.entries);
+
+    const real = await call('POST', '/cache/gc', {});
+    assert.equal(real.status, 200);
+    assert.equal(real.json.dry_run, false);
+    assert.deepEqual(real.json.kept_keys, [pinned]);
+    assert.deepEqual(real.json.removed_keys, removable);
+    assert.deepEqual((await call('GET', '/cache')).json.entries, [pinned]);
+    assert.equal((await call('GET', `/cache/${pinned}?meta=1`)).status, 200, 'the retained entry still serves');
+
+    assert.equal((await call('POST', '/cache/gc', { keep: [hex('9')] })).status, 404);
+    assert.equal((await call('POST', '/cache/gc', { keep: ['nope'] })).status, 400);
+    assert.equal((await call('POST', '/cache/gc', { dry_run: 1 })).status, 400);
+    assert.equal((await call('POST', '/cache/gc', { bogus: true })).status, 400);
+    assert.equal((await call('POST', '/cache/gc', 'nope')).status, 400);
   });
 });

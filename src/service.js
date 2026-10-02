@@ -1,7 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
-import { canonicalJson, digestOf, sha256Text } from './canonical.js';
+import { assertDigest, canonicalJson, digestOf, sha256Text } from './canonical.js';
 import { ConflictError, NotFoundError, ValidationError } from './errors.js';
 import { commandSources, executeArtifact, normalizeCommand } from './executor.js';
 import {
@@ -767,6 +767,125 @@ export class Cachelattice {
   async cacheEntries(limit = 500) {
     await this.loading;
     return this.store.listKeys(limit);
+  }
+
+  // -------------------------------------------------------- garbage collection
+
+  // Retains every entry named by a registered graph's last run plus the explicit
+  // keep set, then deletes every other manifest and the blobs only those
+  // manifests referenced. A full scan first proves the whole cache is sound: an
+  // invalid manifest, a missing or mismatched blob, or a keep key without an
+  // entry aborts the collection before any object is deleted.
+  async collectGarbage(body = {}) {
+    await this.loading;
+    if (!isPlainObject(body)) throw new ValidationError('gc request body must be a JSON object');
+    for (const field of Object.keys(body)) {
+      if (field !== 'keep' && field !== 'dry_run') {
+        throw new ValidationError(`gc request contains an unknown field: ${field}`);
+      }
+    }
+    const keep = body.keep === undefined ? [] : body.keep;
+    if (!Array.isArray(keep)) throw new ValidationError('gc keep must be an array of cache keys');
+    const dryRun = body.dry_run === undefined ? false : body.dry_run;
+    if (typeof dryRun !== 'boolean') throw new ValidationError('gc dry_run must be a boolean');
+
+    // The default retention set: node keys from every graph's last run. A graph
+    // that has never run contributes nothing, and ordering or repetition within
+    // a run cannot matter once this is a set.
+    const retained = new Set();
+    for (const run of this.runs.values()) {
+      for (const node of run.nodes) retained.add(assertCacheKey(node.key));
+    }
+    for (const key of keep) retained.add(assertCacheKey(key));
+
+    // Phase 1: scan and validate every manifest and the blob it references. Any
+    // failure here is reported and leaves the object store untouched.
+    const allKeys = await this.store.scanManifestKeys();
+    for (const key of allKeys) assertCacheKey(key);
+    const manifests = new Map();
+    for (const key of allKeys) {
+      const manifest = await this.store.readManifest(key);
+      if (manifest.key !== key) {
+        throw new ValidationError(`cache manifest stored for key ${key} claims a different key`);
+      }
+      if (typeof manifest.digest !== 'string') {
+        throw new ValidationError(`cache manifest for key ${key} is missing a digest`);
+      }
+      let digestHex;
+      try {
+        assertDigest(manifest.digest, `cache manifest for key ${key} digest`);
+        digestHex = manifest.digest.slice('sha256:'.length);
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          throw new ValidationError(`cache manifest for key ${key} carries an invalid digest: ${manifest.digest}`);
+        }
+        throw error;
+      }
+      let bytes;
+      try {
+        bytes = await this.store.readBlob(digestHex);
+      } catch (error) {
+        if (error instanceof NotFoundError) {
+          throw new ValidationError(`cache manifest for key ${key} references a blob that is missing`);
+        }
+        throw error;
+      }
+      if (digestOf(bytes) !== manifest.digest) {
+        throw new ValidationError(`cache manifest for key ${key} references a blob that does not match its digest`);
+      }
+      manifests.set(key, manifest);
+    }
+
+    // A keep request for a key the cache cannot serve is a 404, not a silent
+    // no-op, so callers learn that their pin never applied. Checked only after
+    // the scan proved the cache sound, and before any deletion.
+    for (const key of retained) {
+      if (!manifests.has(key)) throw new NotFoundError(`cache entry ${key} does not exist`);
+    }
+
+    // Phase 2: partition. A blob is kept exactly when a kept manifest references
+    // it; every other blob on disk is garbage, including orphan blobs that no
+    // manifest references at all. Shared blobs are counted once.
+    const keptKeys = new Set();
+    const removedKeys = new Set();
+    const keptDigests = new Set();
+    for (const [key, manifest] of manifests) {
+      if (retained.has(key)) {
+        keptKeys.add(key);
+        keptDigests.add(manifest.digest);
+      } else {
+        removedKeys.add(key);
+      }
+    }
+
+    const onDisk = await this.store.scanBlobs();
+    const removedDigests = new Set();
+    let keptBytes = 0;
+    let removedBytes = 0;
+    for (const blob of onDisk) {
+      if (keptDigests.has(`sha256:${blob.digest}`)) {
+        keptBytes += blob.size;
+      } else {
+        removedDigests.add(blob.digest);
+        removedBytes += blob.size;
+      }
+    }
+
+    // Phase 3: delete only after the full set is computed, so a dry run reports
+    // exactly what a real run would remove.
+    if (!dryRun) {
+      for (const key of removedKeys) await this.store.deleteManifest(key);
+      for (const digest of removedDigests) await this.store.deleteBlob(digest);
+    }
+
+    return {
+      dry_run: dryRun,
+      kept_keys: [...keptKeys].sort(),
+      removed_keys: [...removedKeys].sort(),
+      removed_digests: [...removedDigests].map((digest) => `sha256:${digest}`).sort(),
+      kept_bytes: keptBytes,
+      removed_bytes: removedBytes,
+    };
   }
 
   // ----------------------------------------------------------- idempotency

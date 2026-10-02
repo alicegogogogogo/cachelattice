@@ -264,16 +264,43 @@ persisted under `meta/idempotency/` and a repeat with that key returns the store
 status and body without re-executing anything. Keys are scoped to the request
 target.
 
+### `POST /cache/gc` — retention and garbage collection
+
+Body `{}`, `{"keep":["<64 lowercase hex>"]}`, `{"dry_run":true}` or both. The
+default retention set is the node key of every node in every registered graph's
+`last_run` (a graph that has never run contributes nothing); `keep` pins
+additional keys. Order is irrelevant and repeated keys count once. Every cache
+entry outside the retained set is deleted with its manifest, and every blob not
+referenced by a retained manifest — including orphan blobs — is deleted too.
+
+The whole cache is scanned and proven sound first: an invalid manifest, a
+manifest whose stored key does not match its name, a missing or malformed
+digest, or a referenced blob that is missing or fails its digest check is a
+`400 validation_error`; an illegal key, a non-boolean `dry_run` or an unknown
+field is `400`; a `keep` key without an entry is `404 not_found`. Any of these
+leaves every object in place.
+
+`200` with `{dry_run, kept_keys, removed_keys, removed_digests, kept_bytes,
+removed_bytes}`. Key and digest arrays are sorted and de-duplicated; digests use
+the `sha256:<hex>` form. `kept_bytes` sums the distinct blobs referenced by
+retained manifests and `removed_bytes` sums the distinct blobs deleted; with
+`dry_run: true` the same sets and totals are reported but nothing is removed.
+Garbage collection never changes `GET /cache`, `GET /stats`, graph runs,
+verification, or the remote cache protocol.
+
 ## CLI
 
 ```bash
 node src/cli.js serve [--host H] [--port P] [--data DIR] [--workspace DIR]
 node src/cli.js run --graph ID [--data DIR] [--workspace DIR] [--out FILE] [--no-cache]
 node src/cli.js stats [--data DIR] [--workspace DIR]
+node src/cli.js gc [--data DIR] [--keep KEY ...] [--dry-run]
 ```
 
 `run` prints the same JSON as the HTTP run endpoint, and with `--out FILE` it also
 materializes the last node's artifact. `stats` prints the counters and cached keys.
+`gc` prints the same JSON as `POST /cache/gc`; repeat `--keep KEY` to pin extra
+keys, and `--dry-run` reports the sets and byte totals without deleting anything.
 
 ## Tests
 

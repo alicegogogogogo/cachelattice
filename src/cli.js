@@ -13,6 +13,7 @@ Usage:
   node src/cli.js serve [--host H] [--port P] [--data DIR] [--workspace DIR]
   node src/cli.js run --graph ID [--data DIR] [--workspace DIR] [--out FILE] [--no-cache]
   node src/cli.js stats [--data DIR] [--workspace DIR]
+  node src/cli.js gc [--data DIR] [--keep KEY ...] [--dry-run]
 
 The data directory defaults to .cachelattice and the workspace to the current
 directory. The service prints "Cachelattice listening on http://<host>:<port>"
@@ -30,6 +31,8 @@ function parse(argv) {
       workspace: { type: 'string', default: '.' },
       graph: { type: 'string' },
       out: { type: 'string' },
+      keep: { type: 'string', multiple: true },
+      'dry-run': { type: 'boolean', default: false },
       cache: { type: 'boolean', default: true },
       help: { type: 'boolean', default: false, short: 'h' },
     },
@@ -83,6 +86,13 @@ async function stats(values) {
   process.stdout.write(`${canonicalJson({ ...summary, keys })}\n`);
 }
 
+async function gc(values) {
+  const service = new Cachelattice({ dataDirectory: values.data, workspace: values.workspace });
+  await service.loading;
+  const result = await service.collectGarbage({ keep: values.keep ?? [], dry_run: values['dry-run'] });
+  process.stdout.write(`${canonicalJson(result)}\n`);
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const { command, values } = parse(argv);
   if (values.help || !command) {
@@ -92,6 +102,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (command === 'serve') await serve(values);
   else if (command === 'run') await run(values);
   else if (command === 'stats') await stats(values);
+  else if (command === 'gc') await gc(values);
   else throw new ValidationError(`unknown command: ${command}`);
   return 0;
 }
