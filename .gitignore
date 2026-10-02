@@ -1,0 +1,7 @@
+# Cachelattice data directories
+.cachelattice/
+cachelattice-data/
+*.cache-data/
+
+# CLI output staging
+out/

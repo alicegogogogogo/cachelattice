@@ -1,0 +1,5 @@
+{
+  "//": "Node treats a directory argument to --test as one module entry, so this manifest makes `node --test tests/` resolve to the suite file.",
+  "type": "module",
+  "main": "index.test.js"
+}

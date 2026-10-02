@@ -1,0 +1,607 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { after, afterEach, before, beforeEach, describe, test } from 'node:test';
+
+import { canonicalJson, digestOf } from '../src/canonical.js';
+import { ConflictError, NotFoundError, ValidationError } from '../src/errors.js';
+import { executeArtifact, normalizeCommand } from '../src/executor.js';
+import { actionKey, normalizeCacheInputs, normalizeEnv, normalizeInputs, normalizePath } from '../src/key.js';
+import { Cachelattice } from '../src/service.js';
+import { createServer } from '../src/server.js';
+import { ObjectStore } from '../src/store.js';
+
+const AMBIENT = { LANG: 'en_US.UTF-8', CC: 'cc' };
+const ZEROS = `sha256:${'0'.repeat(64)}`;
+const hex = (char, length = 64) => char.repeat(length);
+const fileIn = (file) => ({ kind: 'file', path: file });
+const fileWith = (file, digest) => ({ kind: 'file', path: file, digest });
+const hashIn = (file, digest) => ({ kind: 'hash', path: file, digest });
+const filterCmd = (over = {}) => ({ kind: 'filter-lines', source: 'src/app.txt', pattern: 'a', match: 'keep', ...over });
+const keysOf = (run) => Object.fromEntries(run.nodes.map((node) => [node.id, node.key]));
+
+let root;
+let workspace;
+let service;
+
+beforeEach(async () => {
+  root = await mkdtemp(path.join(tmpdir(), 'cachelattice-'));
+  workspace = path.join(root, 'workspace');
+  await mkdir(path.join(workspace, 'src'), { recursive: true });
+  await writeFile(path.join(workspace, 'src', 'app.txt'), 'alpha\nbeta\ngamma\n');
+  await writeFile(path.join(workspace, 'src', 'head.txt'), '<head>\n');
+  await writeFile(path.join(workspace, 'src', 'tail.txt'), '<tail>\n');
+  service = new Cachelattice({
+    dataDirectory: path.join(root, 'data'),
+    workspace,
+    ambientEnv: AMBIENT,
+    clock: () => new Date('2024-05-05T05:05:05.000Z'),
+  });
+  await service.loading;
+});
+
+afterEach(() => rm(root, { recursive: true, force: true }));
+
+const registerFilter = (name = 'filter', over = {}) =>
+  service.putAction({ name, command: filterCmd(over), inputs: [fileIn('src/app.txt')], env: ['LANG'] });
+
+const runOne = async (action = 'filter', id = 'build') => {
+  await service.putGraph(id, { id, nodes: [{ id: 'a', action }] });
+  return service.runGraph(id);
+};
+
+const execute = (command, extra = {}) =>
+  executeArtifact({
+    command,
+    inputs: extra.inputs ?? [fileIn('src/app.txt')],
+    env: extra.env ?? { names: [], values: {} },
+    dependencies: [],
+    workspace,
+  });
+
+describe('commands: each is a pure function of its declared inputs', () => {
+  const text = async (command, extra) => (await execute(command, extra)).toString();
+
+  test('every command kind has one deterministic output', async () => {
+    assert.equal(await text({ kind: 'copy-file', source: 'src/app.txt' }), 'alpha\nbeta\ngamma\n');
+    assert.equal(await text({ kind: 'write-file', content: 'hello' }, { inputs: [] }), 'hello');
+    assert.equal(
+      await text({ kind: 'concat-text', sources: ['src/tail.txt', 'src/head.txt'], separator: '|' }, { inputs: [] }),
+      '<tail>\n|<head>\n',
+      'concat keeps its declared source order, unlike the input list',
+    );
+    // Replacements run in sorted find order, so the "A" introduced by the first
+    // replacement is not rewritten by the second.
+    assert.equal(
+      await text({
+        kind: 'substitute-text',
+        source: 'src/app.txt',
+        replacements: [
+          { find: 'a', replace: 'A' },
+          { find: 'A', replace: 'nested' },
+        ],
+      }),
+      'AlphA\nbetA\ngAmmA\n',
+    );
+    assert.equal(await text(filterCmd({ pattern: '^a|^g' })), 'alpha\ngamma\n');
+    assert.equal(await text(filterCmd({ pattern: '^a|^g', match: 'drop' })), 'beta\n');
+    assert.equal(await text(filterCmd({ pattern: '^a|^g', keep_final_newline: false })), 'alpha\ngamma');
+    const template = { kind: 'template-hash', fields: ['CC', 'LANG'] };
+    const env = { names: ['CC', 'LANG'], values: { CC: 'gcc', LANG: 'C' } };
+    const buffer = await execute(template, { inputs: [], env });
+    assert.deepEqual(JSON.parse(buffer.toString()).fields, { CC: 'gcc', LANG: 'C' });
+    assert.equal(buffer.toString(), `${canonicalJson(JSON.parse(buffer.toString()))}\n`);
+    assert.ok(buffer.equals(await execute(template, { inputs: [], env })));
+  });
+
+  test('unreadable inputs and unknown commands fail loudly', async () => {
+    await assert.rejects(
+      execute({ kind: 'copy-file', source: 'src/absent.txt' }, { inputs: [] }),
+      (error) => error.code === 'action_failed' && /missing from the workspace/.test(error.message),
+    );
+    await assert.rejects(
+      execute({ kind: 'copy-file', source: 'src/app.txt' }, { inputs: [hashIn('src/app.txt', hex('a'))] }),
+      (error) => error.code === 'action_failed' && /precomputed hash/.test(error.message),
+    );
+    assert.throws(() => normalizeCommand({ kind: 'shell' }), /command kind/);
+    assert.throws(() => normalizeCommand({ kind: 'substitute-text', source: 'a', replacements: [] }), /empty/);
+    assert.throws(() => normalizeCommand({ kind: 'filter-lines', source: 'a', pattern: '(' }), /regular expression/);
+    assert.throws(() => normalizeCommand({ kind: 'template-hash', fields: ['b', 'b'] }), /unique/);
+  });
+});
+
+describe('normalization', () => {
+  test('paths fold and escapes are refused; inputs sort; env is an allow-list', () => {
+    assert.equal(normalizePath('a//b/./c.txt'), 'a/b/c.txt');
+    assert.equal(normalizePath('a\\b.txt'), 'a/b.txt');
+    for (const bad of ['', '.', '..', '../x', '/abs', 'C:/x', 'a/../../x']) {
+      assert.throws(() => normalizePath(bad), ValidationError, `expected ${bad} to be refused`);
+    }
+    assert.deepEqual(normalizeInputs([fileIn('b.txt'), hashIn('a.txt', hex('2'))]), [
+      { kind: 'hash', path: 'a.txt', digest: hex('2') },
+      { kind: 'file', path: 'b.txt' },
+    ]);
+    assert.deepEqual(normalizeCacheInputs([fileWith('a.txt', ZEROS), hashIn('b.txt', hex('2'))]), [
+      { kind: 'file', path: 'a.txt', digest: ZEROS },
+      { kind: 'hash', path: 'b.txt', digest: hex('2') },
+    ]);
+    assert.throws(() => normalizeCacheInputs([fileWith('a.txt', ZEROS), fileWith('a.txt', ZEROS)]), /listed twice/);
+    assert.deepEqual(normalizeEnv(['B', 'A'], { A: '1', B: '2', C: '3' }), { names: ['A', 'B'], values: { A: '1', B: '2' } });
+    assert.throws(() => normalizeEnv(['NOPE'], {}), /not set/);
+    assert.throws(() => normalizeEnv(['A', 'A'], { A: '1' }), /unique/);
+  });
+});
+
+describe('object store', () => {
+  test('identical bytes land on one path and are never rewritten', async () => {
+    const store = new ObjectStore(path.join(root, 'objects'));
+    const digest = await store.writeBlob(Buffer.from('same'));
+    assert.equal(await store.writeBlob(Buffer.from('same')), digest);
+    assert.equal(digestOf(Buffer.from('same')), `sha256:${digest}`);
+  });
+
+  test('mismatched, missing and corrupted entries are all refused', async () => {
+    const store = new ObjectStore(path.join(root, 'objects'));
+    const key = hex('a');
+    await store.writeManifest(key, { key: hex('b'), digest: ZEROS, size: 1 });
+    await assert.rejects(store.readManifest(key), /claims a different key/);
+    await store.writeManifest(key, { key, digest: `sha256:${hex('c')}`, size: 1 });
+    await assert.rejects(store.readArtifact(key), (error) => error.code === 'not_found');
+    const digest = await store.writeBlob(Buffer.from('payload'));
+    await writeFile(store.blobPath(digest), 'tampered');
+    await store.writeManifest(key, { key, digest: `sha256:${digest}`, size: 7 });
+    await assert.rejects(store.readArtifact(key), /does not match its manifest digest/);
+    assert.throws(() => store.manifestPath('not-a-key'), /64 lowercase hex/);
+  });
+});
+
+describe('action keys', () => {
+  test('declaration order never reaches the key', async () => {
+    const command = { kind: 'concat-text', sources: ['src/head.txt', 'src/tail.txt'], separator: '|' };
+    const first = await service.putAction({
+      name: 'gather',
+      command,
+      inputs: [fileIn('src/tail.txt'), fileIn('src/head.txt')],
+      env: ['CC', 'LANG'],
+    });
+    const second = await service.putAction({
+      name: 'gather-two',
+      command,
+      inputs: [fileIn('src/head.txt'), fileIn('src/tail.txt')],
+      env: ['LANG', 'CC'],
+    });
+    assert.equal(first.key, second.key);
+    assert.notEqual(first.action_id, second.action_id, 'names still identify separate actions');
+  });
+
+  test('paths are normalized before hashing, file bytes are hashed after', async () => {
+    const plain = await registerFilter('plain');
+    const dotted = await service.putAction({
+      name: 'dotted',
+      command: filterCmd({ source: './src/app.txt' }),
+      inputs: [fileIn('src/./app.txt')],
+      env: ['LANG'],
+    });
+    assert.equal(plain.key, dotted.key);
+    assert.deepEqual(dotted.inputs, [fileWith('src/app.txt', plain.inputs[0].digest)]);
+
+    await writeFile(path.join(workspace, 'src', 'app.txt'), 'alpha\ndelta\n');
+    const refreshed = await service.putAction(
+      { name: 'plain', command: filterCmd(), inputs: [fileIn('src/app.txt')], env: ['LANG'] },
+      { refresh: true },
+    );
+    assert.notEqual(refreshed.key, plain.key, 'the snapshot is retaken and the bytes changed');
+    assert.notEqual(refreshed.inputs[0].digest, plain.inputs[0].digest);
+  });
+
+  test('command content, environment names and unset variables', async () => {
+    const kept = await registerFilter('keeper');
+    assert.notEqual(kept.key, (await registerFilter('dropper', { match: 'drop' })).key);
+    assert.notEqual(kept.key, (await registerFilter('other-pattern', { pattern: 'beta' })).key);
+    const noEnv = await service.putAction({ name: 'no-env', command: filterCmd(), inputs: [fileIn('src/app.txt')], env: [] });
+    assert.notEqual(kept.key, noEnv.key);
+    await assert.rejects(
+      service.putAction({ name: 'needs-env', command: filterCmd(), inputs: [fileIn('src/app.txt')], env: ['MISSING'] }),
+      /MISSING/,
+    );
+  });
+});
+
+describe('validation', () => {
+  test('unknown fields, escaped paths and undeclared reads are refused', async () => {
+    const put = (body) => service.putAction(body);
+    await assert.rejects(
+      put({ name: 'x', command: { kind: 'write-file', content: 'x' }, inputs: [fileIn('src/app.txt')], env: [], cache: true }),
+      /unknown field: cache/,
+    );
+    for (const candidate of ['../secrets', '/etc/passwd', 'C:/windows/system32']) {
+      await assert.rejects(
+        put({ name: 'escape', command: { kind: 'copy-file', source: candidate }, inputs: [fileIn(candidate)], env: [] }),
+        /inside the workspace|relative to the workspace/,
+      );
+    }
+    await assert.rejects(
+      put({ name: 'undeclared', command: { kind: 'copy-file', source: 'src/tail.txt' }, inputs: [fileIn('src/app.txt')], env: [] }),
+      /not a declared input/,
+    );
+    await assert.rejects(
+      put({ name: 'gone', command: { kind: 'copy-file', source: 'src/absent.txt' }, inputs: [fileIn('src/absent.txt')], env: [] }),
+      /does not exist/,
+    );
+  });
+
+  test('input kinds and hash digests are flatly enforced', async () => {
+    const put = (name, inputs) => service.putAction({ name, command: { kind: 'write-file', content: 'x' }, inputs, env: [] });
+    await assert.rejects(put('smuggle', [fileWith('src/app.txt', ZEROS)]), /must not carry a digest/);
+    await assert.rejects(put('bare', [{ kind: 'hash', path: 'a.tar' }]), /must carry a digest/);
+    // A hash input references an action key: plain hex, no sha256: prefix.
+    await assert.rejects(put('prefixed', [hashIn('a.tar', ZEROS)]), /64 lowercase hex/);
+  });
+
+  test('a name is claimed once and PUT replaces it', async () => {
+    const first = await registerFilter('dup');
+    await assert.rejects(registerFilter('dup'), (error) => error instanceof ConflictError);
+    const replacement = { name: 'dup', command: filterCmd({ pattern: 'beta' }), inputs: [fileIn('src/app.txt')], env: ['LANG'] };
+    await assert.rejects(service.putAction(replacement), /already registered/);
+    const replaced = await service.putAction(replacement, { refresh: true });
+    assert.notEqual(replaced.key, first.key);
+    assert.equal((await service.getAction('dup')).key, replaced.key);
+    await assert.rejects(service.getAction('nope'), (error) => error instanceof NotFoundError);
+  });
+
+  test('a graph must reference registered actions in dependency order', async () => {
+    await registerFilter();
+    await assert.rejects(service.putGraph('g', { nodes: [{ id: 'a', action: 'absent' }] }), /unregistered action/);
+    await assert.rejects(service.putGraph('g', { nodes: [{ id: 'a', action: 'filter', needs: ['b'] }] }), /not defined earlier/);
+    await assert.rejects(service.putGraph('g', { nodes: [{ id: 'a', action: 'filter', needs: ['a'] }] }), /needs itself/);
+    await assert.rejects(service.putGraph('g', { nodes: [{ id: 'a', action: 'filter' }], concurrency: 0 }), /concurrency/);
+    await assert.rejects(service.getGraph('missing'), (error) => error instanceof NotFoundError);
+    await assert.rejects(service.runGraph('missing'), (error) => error instanceof NotFoundError);
+  });
+
+  test('a declared producer must be a real producer on a real edge', async () => {
+    const producer = await registerFilter('producer');
+    const consumer = (dependsOn) => ({
+      name: 'honest',
+      command: { kind: 'write-file', content: 'x' },
+      // A declared producer must have its artifact declared as a hash input; the
+      // "liar" below claims the dependency without consuming anything.
+      inputs: dependsOn.length > 0 ? [hashIn('filtered.txt', producer.key)] : [fileIn('src/app.txt')],
+      env: [],
+      depends_on: dependsOn,
+    });
+    await assert.rejects(service.putAction(consumer(['producer']).valueOf() && { ...consumer(['producer']), inputs: [fileIn('src/app.txt')] }), /does not declare its artifact/);
+    const honest = await service.putAction(consumer(['producer']));
+    assert.equal(
+      honest.key,
+      actionKey({
+        command: { kind: 'write-file', content: 'x' },
+        inputs: [hashIn('filtered.txt', producer.key)],
+        env: { names: [], values: {} },
+      }),
+      'depends_on is outside the action key; the graph edge is what binds them',
+    );
+    await service.putGraph('wired', {
+      id: 'wired',
+      nodes: [
+        { id: 'a', action: 'producer' },
+        { id: 'b', action: 'honest', needs: ['a'] },
+      ],
+    });
+    const run = await service.runGraph('wired');
+    const byId = Object.fromEntries(run.nodes.map((node) => [node.id, node]));
+    assert.equal(byId.a.key, producer.key, 'a root node key is exactly its action key');
+    assert.notEqual(byId.b.key, honest.key, 'a node key folds in the keys it depends on');
+    assert.deepEqual(byId.b.dependencies.map((entry) => entry.action_id), ['producer']);
+
+    await service.putGraph('orphan', { nodes: [{ id: 'a', action: 'honest' }] });
+    await assert.rejects(service.runGraph('orphan'), /declares depends_on/);
+  });
+});
+
+describe('cache hits and misses', () => {
+  test('the first run misses, the second hits, and both artifacts are byte identical', async () => {
+    await registerFilter();
+    const first = await runOne();
+    assert.deepEqual(
+      { hits: first.cache_hits, misses: first.cache_misses, cache: first.nodes[0].cache, reused: first.plan_reused },
+      { hits: 0, misses: 1, cache: 'miss', reused: false },
+    );
+    const second = await service.runGraph('build');
+    assert.deepEqual(
+      { hits: second.cache_hits, misses: second.cache_misses, cache: second.nodes[0].cache, reused: second.plan_reused },
+      { hits: 1, misses: 0, cache: 'hit', reused: true },
+    );
+    assert.equal(second.run_key, first.run_key);
+    assert.equal(second.nodes[0].digest, first.nodes[0].digest);
+
+    const missed = await service.cacheGet(first.nodes[0].key);
+    const hit = await service.cacheGet(second.nodes[0].key);
+    assert.ok(missed.buffer.equals(hit.buffer), 'miss bytes and hit bytes must be identical');
+    assert.equal(missed.buffer.toString(), 'alpha\nbeta\ngamma\n');
+    assert.deepEqual(missed.manifest, hit.manifest, 'manifests must be byte identical too');
+
+    const recomputed = await service.runGraph('build', { useCache: false });
+    assert.deepEqual({ cache: recomputed.nodes[0].cache, digest: recomputed.nodes[0].digest }, { cache: 'miss', digest: first.nodes[0].digest });
+  });
+
+  test('verify reports byte identical artifacts, or corruption', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const clean = await service.verifyGraph('build');
+    assert.deepEqual(
+      { identical: clean.identical, comparisons: clean.comparisons, bytes: clean.byte_identical, issues: clean.issues },
+      { identical: true, comparisons: 1, bytes: 1, issues: [] },
+    );
+    await writeFile(service.store.blobPath(run.nodes[0].digest.slice('sha256:'.length)), 'tampered');
+    const tampered = await service.verifyGraph('build');
+    assert.deepEqual(
+      { identical: tampered.identical, bytes: tampered.byte_identical, issue: tampered.issues[0].issue },
+      { identical: false, bytes: 0, issue: 'cache_unreadable' },
+    );
+  });
+
+  test('different names sharing one definition share one cache entry', async () => {
+    await registerFilter('first');
+    await registerFilter('second');
+    await service.putGraph('g', {
+      id: 'g',
+      nodes: [
+        { id: 'a', action: 'first' },
+        { id: 'b', action: 'second' },
+      ],
+    });
+    const run = await service.runGraph('g');
+    assert.equal(run.nodes[0].key, run.nodes[1].key);
+    assert.deepEqual(Object.fromEntries(run.nodes.map((node) => [node.id, node.cache])), { a: 'miss', b: 'hit' });
+    assert.equal((await service.stats()).cache_entries, 1);
+  });
+
+  test('a diamond respects the concurrency limit without changing any digest', async () => {
+    const source = await service.putAction({
+      name: 'source',
+      command: { kind: 'copy-file', source: 'src/app.txt' },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    const leaf = (name, content) =>
+      service.putAction({
+        name,
+        command: { kind: 'write-file', content },
+        inputs: [hashIn('in.txt', source.key)],
+        env: [],
+        depends_on: ['source'],
+      });
+    const left = await leaf('left', 'left');
+    const right = await leaf('right', 'right');
+    await service.putAction({
+      name: 'join',
+      command: { kind: 'write-file', content: 'joined' },
+      inputs: [hashIn('left.txt', left.key), hashIn('right.txt', right.key)],
+      env: [],
+      depends_on: ['left', 'right'],
+    });
+    const nodes = [
+      { id: 'a', action: 'source' },
+      { id: 'b', action: 'left', needs: ['a'] },
+      { id: 'c', action: 'right', needs: ['a'] },
+      { id: 'd', action: 'join', needs: ['b', 'c'] },
+    ];
+    await service.putGraph('narrow', { id: 'narrow', concurrency: 2, nodes });
+    const serial = await service.runGraph('narrow');
+    await service.putGraph('wide', { id: 'wide', concurrency: 3, nodes });
+    const wide = await service.runGraph('wide');
+    assert.equal(serial.cache_misses, 4);
+    assert.ok(serial.peak_parallel <= 2);
+    assert.equal(wide.cache_hits, 4, 'the same keys must hit after the first graph ran');
+    assert.deepEqual(
+      wide.nodes.map((node) => [node.id, node.digest]),
+      serial.nodes.map((node) => [node.id, node.digest]),
+      'concurrency must not change any artifact digest',
+    );
+  });
+
+  test('an upstream change moves every downstream key', async () => {
+    const source = await service.putAction({
+      name: 'source',
+      command: { kind: 'copy-file', source: 'src/app.txt' },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    const wrap = (digest) => ({
+      name: 'wrap',
+      command: { kind: 'write-file', content: 'wrapped' },
+      inputs: [hashIn('in.txt', digest)],
+      env: [],
+      depends_on: ['source'],
+    });
+    await service.putAction(wrap(source.key));
+    await service.putGraph('chain', {
+      id: 'chain',
+      nodes: [
+        { id: 'a', action: 'source' },
+        { id: 'b', action: 'wrap', needs: ['a'] },
+      ],
+    });
+    const first = await service.runGraph('chain');
+
+    await writeFile(path.join(workspace, 'src', 'app.txt'), 'alpha\ndelta\n');
+    const rebuilt = await service.putAction(
+      { name: 'source', command: { kind: 'copy-file', source: 'src/app.txt' }, inputs: [fileIn('src/app.txt')], env: [] },
+      { refresh: true },
+    );
+    // The consumer must follow the producer it consumes: exactly the authoring
+    // burden the dependency check enforces.
+    await service.putAction(wrap(rebuilt.key), { refresh: true });
+    const second = await service.runGraph('chain');
+    assert.deepEqual(second.stale_nodes.map((node) => node.id), ['a', 'b']);
+    assert.notDeepEqual(keysOf(second), keysOf(first));
+    assert.equal(second.cache_misses, 2, 'the consumer is conservatively rebuilt');
+  });
+});
+
+describe('remote cache entries', () => {
+  test('an entry is accepted only when its fields recompute to the claimed key', async () => {
+    const content = await readFile(path.join(workspace, 'src', 'app.txt'));
+    const action = await service.putAction({
+      name: 'seed',
+      command: { kind: 'copy-file', source: 'src/app.txt' },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    const entry = {
+      action_id: 'peer',
+      command: { kind: 'copy-file', source: 'src/app.txt' },
+      inputs: [fileWith('src/app.txt', action.inputs[0].digest)],
+      env: [],
+    };
+    const manifest = await service.cachePut(action.key, entry, content);
+    assert.deepEqual(
+      { key: manifest.key, digest: manifest.digest, env: manifest.env, dependencies: manifest.dependencies },
+      { key: action.key, digest: digestOf(content), env: { names: [], values: {} }, dependencies: [] },
+    );
+    assert.ok((await service.remoteRead(action.key)).buffer.equals(content));
+    await assert.rejects(service.cachePut(action.key, entry, content), /already exists/);
+    await assert.rejects(service.cachePut(hex('f'), entry, content), /same fields hash to/);
+    await assert.rejects(service.cachePut(action.key, { ...entry, surprise: 1 }, content), /unknown field: surprise/);
+    await assert.rejects(service.cachePut('nope', entry, content), /64 lowercase hex/);
+  });
+
+  test('a peer entry serves a root node without re-executing it', async () => {
+    const content = Buffer.from('from peer\n');
+    const seed = hashIn('seed.bin', hex('e'));
+    const action = await service.putAction({
+      name: 'peer-copy',
+      command: { kind: 'write-file', content: 'from peer\n' },
+      inputs: [seed],
+      env: [],
+    });
+    await service.cachePut(
+      action.key,
+      { action_id: 'peer', command: { kind: 'write-file', content: 'from peer\n' }, inputs: [seed], env: [] },
+      content,
+    );
+    const run = await runOne('peer-copy', 'peer');
+    assert.deepEqual({ hits: run.cache_hits, misses: run.cache_misses }, { hits: 1, misses: 0 });
+    assert.ok((await service.cacheGet(run.nodes[0].key)).buffer.equals(content));
+  });
+});
+
+describe('HTTP contract', () => {
+  let base;
+  let httpRoot;
+  let server;
+
+  before(async () => {
+    httpRoot = await mkdtemp(path.join(tmpdir(), 'cachelattice-http-'));
+    const httpWorkspace = path.join(httpRoot, 'workspace');
+    await mkdir(path.join(httpWorkspace, 'src'), { recursive: true });
+    await writeFile(path.join(httpWorkspace, 'src', 'app.txt'), 'alpha\nbeta\ngamma\n');
+    const httpService = new Cachelattice({
+      dataDirectory: path.join(httpRoot, 'data'),
+      workspace: httpWorkspace,
+      ambientEnv: { LANG: 'en_US.UTF-8' },
+    });
+    await httpService.loading;
+    server = createServer(httpService);
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    base = `http://127.0.0.1:${server.address().port}`;
+  });
+
+  after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(httpRoot, { recursive: true, force: true });
+  });
+
+  const call = async (method, route, body, headers = {}) => {
+    const init = { method, headers: { ...headers } };
+    if (body !== undefined && body !== null) {
+      init.body = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
+    }
+    const response = await fetch(`${base}${route}`, init);
+    const text = await response.text();
+    const isJson = (response.headers.get('content-type') ?? '').includes('json');
+    return { status: response.status, headers: response.headers, text, json: isJson ? JSON.parse(text) : null };
+  };
+
+  const actionBody = { name: 'filter', command: filterCmd(), inputs: [fileIn('src/app.txt')], env: ['LANG'] };
+
+  test('health, unknown routes and the error envelope', async () => {
+    assert.deepEqual((await call('GET', '/health')).json, { status: 'ok', service: 'cachelattice' });
+    const route = await call('GET', '/nope');
+    assert.deepEqual({ status: route.status, code: route.json.error.code }, { status: 404, code: 'not_found' });
+    const resource = await call('GET', '/actions/absent');
+    assert.deepEqual({ status: resource.status, keys: Object.keys(resource.json.error) }, { status: 404, keys: ['code', 'message'] });
+    assert.equal((await call('POST', '/actions', 'not json')).json.error.code, 'validation_error');
+    const extra = await call('POST', '/actions', { ...actionBody, surcharge: 1 });
+    assert.deepEqual({ status: extra.status, error: extra.json.error.code }, { status: 400, error: 'validation_error' });
+    assert.match(extra.json.error.message, /unknown field: surcharge/);
+    assert.match((await call('POST', '/graphs/build/run', { use_cache: 'yes' })).json.error.message, /use_cache/);
+    assert.equal((await call('GET', '/cache/not-a-key')).status, 400);
+  });
+
+  test('a full run reports a miss, then a hit with byte identical artifacts', async () => {
+    const action = await call('POST', '/actions', actionBody, { 'idempotency-key': 'action-1' });
+    assert.deepEqual({ status: action.status, isKey: /^[0-9a-f]{64}$/.test(action.json.key) }, { status: 201, isKey: true });
+    assert.equal((await call('POST', '/graphs', { id: 'build', concurrency: 1, nodes: [{ id: 'compile', action: 'filter' }] })).status, 201);
+
+    const miss = await call('POST', '/graphs/build/run', {});
+    assert.deepEqual({ hits: miss.json.cache_hits, misses: miss.json.cache_misses }, { hits: 0, misses: 1 });
+    const hit = await call('POST', '/graphs/build/run', {}, { 'idempotency-key': 'run-1' });
+    assert.deepEqual(
+      { hits: hit.json.cache_hits, misses: hit.json.cache_misses, cache: hit.json.nodes[0].cache },
+      { hits: 1, misses: 0, cache: 'hit' },
+    );
+    assert.equal(hit.json.nodes[0].digest, miss.json.nodes[0].digest);
+    assert.deepEqual((await call('POST', '/graphs/build/run', {}, { 'idempotency-key': 'run-1' })).json, hit.json, 'the key replays the answer');
+
+    const key = miss.json.nodes[0].key;
+    const first = await fetch(`${base}/cache/${key}`);
+    const missBytes = Buffer.from(await first.arrayBuffer());
+    assert.deepEqual(
+      { digest: first.headers.get('x-cache-digest'), key: first.headers.get('x-cache-key'), body: missBytes.toString() },
+      { digest: miss.json.nodes[0].digest, key, body: 'alpha\nbeta\ngamma\n' },
+    );
+    const second = await fetch(`${base}/cache/${hit.json.nodes[0].key}`);
+    assert.ok(Buffer.from(await second.arrayBuffer()).equals(missBytes), 'hit and miss artifacts must be byte identical');
+
+    const meta = await call('GET', `/cache/${key}?meta=1`);
+    assert.deepEqual({ digest: meta.json.digest, size: meta.json.size }, { digest: miss.json.nodes[0].digest, size: missBytes.length });
+    const state = await call('GET', '/graphs/build');
+    assert.deepEqual({ hits: state.json.last_run.cache_hits, nodes: state.json.last_run.nodes.length }, { hits: 1, nodes: 1 });
+    assert.equal((await call('GET', '/stats')).json.schema, 'cachelattice/stats/v1');
+    const verify = await call('POST', '/graphs/build/verify', {});
+    assert.deepEqual(
+      { identical: verify.json.identical, bytes: verify.json.byte_identical, issues: verify.json.issues },
+      { identical: true, bytes: 1, issues: [] },
+    );
+  });
+
+  test('a remote upload must recompute to the key it claims', async () => {
+    const content = Buffer.from('remote artifact\n');
+    const rejected = await call('PUT', `/cache/${hex('a')}`, content, {
+      'content-type': 'application/octet-stream',
+      'x-cache-command': JSON.stringify({ kind: 'copy-file', source: 'src/app.txt' }),
+      'x-cache-inputs': JSON.stringify([fileWith('src/app.txt', `sha256:${hex('b')}`)]),
+      'x-cache-env': JSON.stringify([]),
+    });
+    assert.equal(rejected.status, 400);
+    assert.match(rejected.json.error.message, /same fields hash to/);
+
+    const seed = hashIn('seed.bin', hex('e'));
+    const seedBody = { name: 'remote-seed', command: { kind: 'write-file', content: 'remote artifact\n' }, inputs: [seed], env: [] };
+    const acceptedKey = (await call('POST', '/actions', seedBody)).json.key;
+    const upload = {
+      'content-type': 'application/octet-stream',
+      'x-cache-action': 'peer',
+      'x-cache-command': JSON.stringify(seedBody.command),
+      'x-cache-inputs': JSON.stringify([seed]),
+      'x-cache-env': JSON.stringify([]),
+    };
+    assert.equal((await call('PUT', `/cache/${acceptedKey}`, content, upload)).status, 201);
+    assert.equal((await call('GET', `/cache/${acceptedKey}`)).text, 'remote artifact\n');
+    assert.equal((await call('PUT', `/cache/${acceptedKey}`, content, upload)).status, 409);
+    assert.equal((await call('GET', `/cache/${hex('d')}`)).status, 404);
+  });
+});

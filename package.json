@@ -1,0 +1,18 @@
+{
+  "name": "cachelattice",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Content-addressed build cache and dependency scheduler",
+  "type": "module",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "bin": {
+    "cachelattice": "src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test tests/",
+    "serve": "node src/cli.js serve",
+    "stats": "node src/cli.js stats"
+  }
+}
