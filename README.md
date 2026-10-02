@@ -144,11 +144,15 @@ back**:
    compute the same bytes, and the `if (!hasManifest) writeManifest` guard leaves
    the first manifest in place, byte-identical to the second anyway.
 
-`POST /graphs/{id}/verify` turns that argument into an executable check: it
-re-executes every node with cache reads disabled and compares the result against
-what the cache held, by digest and byte by byte. It reports `identical: true`
-with `byte_identical` equal to the node count, or `issues` naming
-`digest_changed`, `bytes_differ` or `cache_unreadable`.
+`POST /graphs/{id}/verify` turns that argument into an executable check. Against
+the last successful run it re-executes every node's frozen action — the command,
+input digests, recorded environment and resolved dependency keys the manifest
+carries — purely in memory, and compares the recomputed digest and size with
+what the cache holds. Verification writes nothing: no blob, manifest, run
+record, idempotency record or stats counter, and no workspace file. It answers
+`200` with one `verified` entry per node, `409 verification_unavailable` when
+there is no successful run or a cache entry cannot be read, and `422
+reproducibility_mismatch` naming every node whose bytes no longer reproduce.
 
 One deliberate consequence: an action whose input changed but which recomputes to
 the same bytes still invalidates every downstream node, because a node key folds
@@ -158,8 +162,9 @@ conservative and can only do extra work, never serve a stale artifact.
 ## HTTP API
 
 All bodies are JSON unless stated otherwise, unknown fields are rejected, and
-errors use `{"error":{"code":"<snake_case>","message":"…"}}`: validation `400`,
-missing `404`, conflict `409`.
+errors use `{"error":{"code":"<snake_case>","message":"…"}}` (some carry
+structured `error.details`): validation `400`, missing `404`, conflict `409`,
+verification unavailable `409`, reproducibility mismatch `422`.
 
 ### `GET /health`
 
@@ -244,6 +249,41 @@ each node's `resources`; all three are empty objects when nothing is declared.
 hashes the resolved `(action_id, key)` pairs. With `use_cache: false` the answer
 is recomputed while the store is still written, which forces a miss without
 corrupting anything.
+
+### `POST /graphs/{id}/verify`
+
+Body must be empty or `{}`; anything else is a `400`. The graph must be
+registered (`404` otherwise) and must have a successful run to check against.
+Verification locates the cache manifest and blob of every node key in that run,
+re-executes each node's frozen action in memory, and compares the recomputed
+digest and size with the manifest. It never writes a cache entry, blob, run
+record, idempotency record or stats counter, and never touches the workspace.
+
+`200` with:
+
+```json
+{
+  "schema": "cachelattice/verify/v1",
+  "graph_id": "build",
+  "reference_run_key": "921010ee…",
+  "verified": [
+    {"node_id": "bundle", "key": "6bd590cb…", "digest": "sha256:1e6ed65d…", "size": 6},
+    {"node_id": "filter", "key": "e71afcbf…", "digest": "sha256:4fdbc441…", "size": 17}
+  ]
+}
+```
+
+`verified` is sorted by node id and lists every node of the reference run, even
+nodes whose content is identical. With the workspace and cache unchanged,
+repeating the call returns the same summary. When the graph has no successful
+run, a node's cache entry is missing, or a manifest or blob fails its address
+checks, the answer is `409 verification_unavailable` with the reason (and the
+`node_id` when one is implicated) in `error.message`; no partial result is
+returned. When the cache reads fine but some node recomputes to a different
+digest or size, the answer is `422 reproducibility_mismatch` with
+`error.details.mismatches`, sorted by `node_id`, each entry carrying
+`node_id`, `expected_digest`, `expected_size`, `actual_digest` and
+`actual_size`.
 
 ### `GET /stats`
 

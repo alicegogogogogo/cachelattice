@@ -60,10 +60,9 @@ export function createServer(service) {
     } catch (error) {
       if (error instanceof CachelatticeError) {
         status = error.status;
-        body = Buffer.from(
-          `${canonicalJson({ error: { code: error.code, message: error.message } })}\n`,
-          'utf8',
-        );
+        const envelope = { code: error.code, message: error.message };
+        if (error.details !== undefined) envelope.details = error.details;
+        body = Buffer.from(`${canonicalJson({ error: envelope })}\n`, 'utf8');
       } else {
         status = 500;
         body = Buffer.from(
@@ -155,10 +154,11 @@ async function route_request(service, request, url, segments, idempotencyKey) {
     const replayed = await service.recall(operation, idempotencyKey);
     if (replayed) return jsonOut(replayed.status, JSON.parse(Buffer.from(replayed.body, 'base64').toString('utf8')));
     return jsonOut(200, await service.runGraph(segments[1], { useCache }), { idempotent: true, operation });
-  }  if (method === 'POST' && segments.length === 3 && segments[0] === 'graphs' && segments[2] === 'verify') {
+  }
+  if (method === 'POST' && segments.length === 3 && segments[0] === 'graphs' && segments[2] === 'verify') {
     const raw = await readBody(request);
-    if (raw.length > 0) parseJson(raw);
-    return jsonOut(200, await service.verifyGraph(segments[1]));
+    const body = raw.length === 0 ? {} : parseJson(raw);
+    return jsonOut(200, await service.verifyGraph(segments[1], body));
   }
 
   if (method === 'GET' && segments.length === 1 && segments[0] === 'stats') {

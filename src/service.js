@@ -2,7 +2,7 @@ import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { canonicalJson, digestOf, sha256Text, assertDigest } from './canonical.js';
-import { ConflictError, NotFoundError, ValidationError } from './errors.js';
+import { ConflictError, NotFoundError, ReproducibilityMismatchError, ValidationError, VerificationUnavailableError } from './errors.js';
 import { commandSources, executeArtifact, normalizeCommand } from './executor.js';
 import {
   actionIdOf,
@@ -20,6 +20,7 @@ import { ObjectStore } from './store.js';
 
 export const MANIFEST_SCHEMA = 'cachelattice/manifest/v1';
 export const RUN_SCHEMA = 'cachelattice/run/v1';
+export const VERIFY_SCHEMA = 'cachelattice/verify/v1';
 const STATS_SCHEMA = 'cachelattice/stats/v1';
 
 const GRAPH_FIELDS = ['id', 'nodes', 'concurrency', 'limits'];
@@ -713,55 +714,79 @@ export class Cachelattice {
 
   // ---------------------------------------------------------------- verify
 
-  // Re-executes the graph with cache reads disabled and compares every node with
-  // what the cache already holds, by digest and byte by byte. A cache entry that
-  // cannot even be read back (missing blob, tampered bytes) is reported as an
-  // issue rather than raised, because that is exactly what verification is for.
-  async verifyGraph(graphId) {
+  // Reproducibility check against the last successful run. Every node key from
+  // that run must still name a readable cache entry - manifest present, key
+  // honest, blob present and matching its address - and re-executing the
+  // frozen action each manifest carries (same command, same input digests,
+  // same recorded environment, same resolved dependency keys) must reproduce
+  // the recorded digest and size. Verification is strictly read-only: it
+  // writes no blob, manifest, run record, idempotency record or stats
+  // counter, and it never touches the workspace. The only bytes read again
+  // are workspace files, which is exactly the drift this check exists to
+  // catch.
+  async verifyGraph(graphId, request = {}) {
     await this.loading;
+    if (!isPlainObject(request)) throw new ValidationError('verify request body must be a JSON object');
+    rejectUnknown(request, [], 'verify request');
+    const graph = this.graphs.get(graphId);
+    if (!graph) throw new NotFoundError(`graph ${graphId} is not registered`);
     const baseline = this.runs.get(graphId);
-    if (!baseline) throw new NotFoundError(`graph ${graphId} has no completed run to verify`);
-    const cached = new Map();
-    const issues = [];
+    if (!baseline) {
+      throw new VerificationUnavailableError(`graph ${graphId} has no successful run to verify against`);
+    }
+
+    const verified = [];
+    const mismatches = [];
     for (const node of baseline.nodes) {
+      let manifest;
       try {
-        const entry = await this.store.readArtifact(node.key);
-        cached.set(node.id, { digest: node.digest, buffer: entry.buffer });
+        manifest = await this.store.readManifest(node.key);
+        assertDigest(manifest.digest, `cache manifest for node ${node.id}`);
+        // Reads the blob behind the manifest and re-checks its content address.
+        await this.store.readArtifact(node.key);
       } catch (error) {
-        issues.push({ id: node.id, issue: 'cache_unreadable', detail: error.message });
+        throw new VerificationUnavailableError(`cannot verify node ${node.id}: ${error.message}`);
+      }
+      let buffer;
+      try {
+        buffer = await executeArtifact({
+          command: manifest.command,
+          inputs: manifest.inputs,
+          env: manifest.env,
+          dependencies: manifest.dependencies,
+          workspace: this.workspace,
+        });
+      } catch (error) {
+        throw new VerificationUnavailableError(`cannot re-execute node ${node.id}: ${error.message}`);
+      }
+      const digest = digestOf(buffer);
+      if (digest === manifest.digest && buffer.length === manifest.size) {
+        verified.push({ node_id: node.id, key: node.key, digest: manifest.digest, size: manifest.size });
+      } else {
+        mismatches.push({
+          node_id: node.id,
+          expected_digest: manifest.digest,
+          expected_size: manifest.size,
+          actual_digest: digest,
+          actual_size: buffer.length,
+        });
       }
     }
-    const rerun = await this.runGraph(graphId, { useCache: false });
-    let byteIdentical = 0;
-    for (const node of rerun.nodes) {
-      const before = cached.get(node.id);
-      if (!before) {
-        if (!issues.some((issue) => issue.id === node.id)) {
-          issues.push({ id: node.id, issue: 'missing_from_baseline' });
-        }
-        continue;
-      }
-      if (before.digest !== node.digest) {
-        issues.push({ id: node.id, issue: 'digest_changed', cached: before.digest, recomputed: node.digest });
-        continue;
-      }
-      let after;
-      try {
-        after = await this.store.readArtifact(node.key);
-      } catch (error) {
-        issues.push({ id: node.id, issue: 'cache_unreadable', detail: error.message });
-        continue;
-      }
-      if (before.buffer.equals(after.buffer)) byteIdentical += 1;
-      else issues.push({ id: node.id, issue: 'bytes_differ', digest: node.digest });
+
+    const byNodeId = (left, right) => (left.node_id < right.node_id ? -1 : left.node_id > right.node_id ? 1 : 0);
+    if (mismatches.length > 0) {
+      mismatches.sort(byNodeId);
+      throw new ReproducibilityMismatchError(
+        `graph ${graphId} did not reproduce ${mismatches.length} of ${baseline.nodes.length} nodes`,
+        mismatches,
+      );
     }
+    verified.sort(byNodeId);
     return {
+      schema: VERIFY_SCHEMA,
       graph_id: graphId,
-      run_key: rerun.run_key,
-      identical: issues.length === 0,
-      comparisons: rerun.nodes.length,
-      byte_identical: byteIdentical,
-      issues,
+      reference_run_key: baseline.run_key,
+      verified,
     };
   }
 

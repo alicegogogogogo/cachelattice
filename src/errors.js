@@ -30,3 +30,20 @@ export class ConflictError extends CachelatticeError {
     super('conflict', message, 409);
   }
 }
+
+// Verification cannot even be attempted: no successful run to check against,
+// or a cache entry that is missing or fails its address checks.
+export class VerificationUnavailableError extends CachelatticeError {
+  constructor(message) {
+    super('verification_unavailable', message, 409);
+  }
+}
+
+// The cache read fine, but re-executing a frozen action produced different
+// bytes. The mismatches ride along as structured details.
+export class ReproducibilityMismatchError extends CachelatticeError {
+  constructor(message, mismatches) {
+    super('reproducibility_mismatch', message, 422);
+    this.details = { mismatches };
+  }
+}

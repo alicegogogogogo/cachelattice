@@ -329,20 +329,103 @@ describe('cache hits and misses', () => {
     assert.deepEqual({ cache: recomputed.nodes[0].cache, digest: recomputed.nodes[0].digest }, { cache: 'miss', digest: first.nodes[0].digest });
   });
 
-  test('verify reports byte identical artifacts, or corruption', async () => {
+  test('verify re-executes the frozen graph read-only and repeats identically', async () => {
     await registerFilter();
     const run = await runOne();
-    const clean = await service.verifyGraph('build');
+    const statsBefore = await service.stats();
+    const clean = await service.verifyGraph('build', {});
+    assert.deepEqual(clean, {
+      schema: 'cachelattice/verify/v1',
+      graph_id: 'build',
+      reference_run_key: run.run_key,
+      verified: [{ node_id: 'a', key: run.nodes[0].key, digest: run.nodes[0].digest, size: run.nodes[0].size }],
+    });
+    assert.deepEqual(await service.verifyGraph('build', {}), clean, 'an unchanged store verifies identically');
+    assert.deepEqual(await service.stats(), statsBefore, 'verification moves no counter');
+    assert.equal((await service.getGraph('build')).last_run.run_key, run.run_key, 'last_run is untouched');
+  });
+
+  test('verify lists nodes with identical content separately, sorted by node id', async () => {
+    await registerFilter('one');
+    await registerFilter('two');
+    await service.putGraph('dup', {
+      id: 'dup',
+      nodes: [
+        { id: 'b', action: 'one' },
+        { id: 'a', action: 'two' },
+      ],
+    });
+    const run = await service.runGraph('dup');
+    assert.equal(run.nodes[0].key, run.nodes[1].key, 'same definition, same node key');
+    const report = await service.verifyGraph('dup', {});
     assert.deepEqual(
-      { identical: clean.identical, comparisons: clean.comparisons, bytes: clean.byte_identical, issues: clean.issues },
-      { identical: true, comparisons: 1, bytes: 1, issues: [] },
+      report.verified.map((node) => node.node_id),
+      ['a', 'b'],
     );
+    assert.equal(report.verified[0].key, report.verified[1].key);
+    assert.equal(report.verified[0].digest, report.verified[1].digest);
+  });
+
+  test('verify reports a changed workspace as a 422 with per-node details', async () => {
+    await registerFilter();
+    const run = await runOne();
+    await writeFile(path.join(workspace, 'src', 'app.txt'), 'alpha\ndelta\n');
+    await assert.rejects(service.verifyGraph('build', {}), (error) => {
+      assert.equal(error.code, 'reproducibility_mismatch');
+      assert.equal(error.status, 422);
+      assert.equal(error.details.mismatches.length, 1);
+      const mismatch = error.details.mismatches[0];
+      assert.equal(mismatch.node_id, 'a');
+      assert.equal(mismatch.expected_digest, run.nodes[0].digest);
+      assert.equal(mismatch.expected_size, run.nodes[0].size);
+      assert.match(mismatch.actual_digest, /^sha256:[0-9a-f]{64}$/);
+      assert.notEqual(mismatch.actual_digest, run.nodes[0].digest);
+      assert.equal(mismatch.actual_size, Buffer.byteLength('alpha\ndelta\n'));
+      return true;
+    });
+    assert.equal((await service.stats()).artifacts_executed, 1, 'a mismatch still writes nothing');
+  });
+
+  test('verify refuses unknown graphs, unrun graphs and unreadable cache entries', async () => {
+    await registerFilter();
+    await service.putGraph('build', { id: 'build', nodes: [{ id: 'a', action: 'filter' }] });
+    await assert.rejects(
+      service.verifyGraph('missing', {}),
+      (error) => error.code === 'not_found' && error.status === 404,
+    );
+    await assert.rejects(
+      service.verifyGraph('build', {}),
+      (error) => error.code === 'verification_unavailable' && error.status === 409 && /no successful run/.test(error.message),
+    );
+
+    const run = await service.runGraph('build');
+    await service.store.deleteManifest(run.nodes[0].key);
+    await assert.rejects(
+      service.verifyGraph('build', {}),
+      (error) => error.code === 'verification_unavailable' && error.status === 409 && error.message.includes('node a'),
+    );
+  });
+
+  test('verify reports a tampered blob as unavailable, not as a mismatch', async () => {
+    await registerFilter();
+    const run = await runOne();
     await writeFile(service.store.blobPath(run.nodes[0].digest.slice('sha256:'.length)), 'tampered');
-    const tampered = await service.verifyGraph('build');
-    assert.deepEqual(
-      { identical: tampered.identical, bytes: tampered.byte_identical, issue: tampered.issues[0].issue },
-      { identical: false, bytes: 0, issue: 'cache_unreadable' },
+    await assert.rejects(
+      service.verifyGraph('build', {}),
+      (error) => error.code === 'verification_unavailable' && error.status === 409 && error.message.includes('node a'),
     );
+  });
+
+  test('verify accepts only an empty object body', async () => {
+    await registerFilter();
+    await runOne();
+    for (const body of [[], 'x', 1, null, { use_cache: true }, { surprise: 1 }]) {
+      await assert.rejects(
+        service.verifyGraph('build', body),
+        (error) => error.code === 'validation_error' && error.status === 400,
+        `expected ${JSON.stringify(body)} to be refused`,
+      );
+    }
   });
 
   test('different names sharing one definition share one cache entry', async () => {
@@ -975,11 +1058,26 @@ describe('HTTP contract', () => {
     const state = await call('GET', '/graphs/build');
     assert.deepEqual({ hits: state.json.last_run.cache_hits, nodes: state.json.last_run.nodes.length }, { hits: 1, nodes: 1 });
     assert.equal((await call('GET', '/stats')).json.schema, 'cachelattice/stats/v1');
+    const statsBefore = (await call('GET', '/stats')).json;
     const verify = await call('POST', '/graphs/build/verify', {});
     assert.deepEqual(
-      { identical: verify.json.identical, bytes: verify.json.byte_identical, issues: verify.json.issues },
-      { identical: true, bytes: 1, issues: [] },
+      { status: verify.status, schema: verify.json.schema, graph: verify.json.graph_id, run: verify.json.reference_run_key },
+      { status: 200, schema: 'cachelattice/verify/v1', graph: 'build', run: hit.json.run_key },
     );
+    assert.deepEqual(
+      verify.json.verified.map((node) => [node.node_id, node.key, node.digest, node.size]),
+      [['compile', key, miss.json.nodes[0].digest, missBytes.length]],
+    );
+    assert.deepEqual((await call('POST', '/graphs/build/verify')).json, verify.json, 'an empty body verifies the same');
+    assert.deepEqual((await call('GET', '/stats')).json, statsBefore, 'verification is read-only');
+    const badVerify = await call('POST', '/graphs/build/verify', { use_cache: false });
+    assert.deepEqual({ status: badVerify.status, code: badVerify.json.error.code }, { status: 400, code: 'validation_error' });
+    const ghostVerify = await call('POST', '/graphs/ghost/verify', {});
+    assert.deepEqual({ status: ghostVerify.status, code: ghostVerify.json.error.code }, { status: 404, code: 'not_found' });
+    const unrun = await call('POST', '/graphs', { id: 'unrun', nodes: [{ id: 'a', action: 'filter' }] });
+    assert.equal(unrun.status, 201);
+    const noRun = await call('POST', '/graphs/unrun/verify', {});
+    assert.deepEqual({ status: noRun.status, code: noRun.json.error.code }, { status: 409, code: 'verification_unavailable' });
   });
 
   test('a remote upload must recompute to the key it claims', async () => {
