@@ -705,6 +705,193 @@ describe('cache garbage collection', () => {
   });
 });
 
+describe('resource limits', () => {
+  const writer = (name, content = name) =>
+    service.putAction({ name, command: { kind: 'write-file', content }, inputs: [fileIn('src/app.txt')], env: [] });
+
+  test('limits and resources are validated and a rejected PUT keeps the old graph', async () => {
+    await writer('w');
+    await service.putGraph('g', { id: 'g', limits: { cpu: 2 }, nodes: [{ id: 'a', action: 'w' }] });
+    const base = { id: 'g', limits: { cpu: 2 }, nodes: [{ id: 'a', action: 'w' }] };
+    const bad = [
+      { limits: [] },
+      { limits: 3 },
+      { limits: { cpu: 0 } },
+      { limits: { cpu: -1 } },
+      { limits: { cpu: 1.5 } },
+      { limits: { cpu: 1000001 } },
+      { limits: { '': 1 } },
+      { limits: { '1cpu': 1 } },
+      { limits: { '-cpu': 1 } },
+      { limits: { 'cpu!': 1 } },
+      { limits: { [`a${'b'.repeat(32)}`]: 1 } },
+      { nodes: [{ id: 'a', action: 'w', resources: [] }] },
+      { nodes: [{ id: 'a', action: 'w', resources: { cpu: -1 } }] },
+      { nodes: [{ id: 'a', action: 'w', resources: { cpu: 1.5 } }] },
+      { nodes: [{ id: 'a', action: 'w', resources: { cpu: 1000001 } }] },
+      { nodes: [{ id: 'a', action: 'w', resources: { gpu: 1 } }] },
+      { nodes: [{ id: 'a', action: 'w', resources: { cpu: 3 } }] },
+    ];
+    for (const patch of bad) {
+      await assert.rejects(
+        service.putGraph('g', { ...base, ...patch }),
+        (error) => error.code === 'validation_error',
+        `expected ${JSON.stringify(patch)} to be refused`,
+      );
+    }
+    const graph = await service.getGraph('g');
+    assert.deepEqual(graph.limits, { cpu: 2 }, 'a failed write leaves the graph untouched');
+    assert.deepEqual(graph.nodes[0].resources, {});
+  });
+
+  test('boundary names and amounts are accepted', async () => {
+    await writer('bw');
+    const name32 = `a${'b'.repeat(31)}`;
+    const graph = await service.putGraph('bounds', {
+      id: 'bounds',
+      limits: { [name32]: 1000000, Z: 1, 'a-b_c': 5 },
+      nodes: [{ id: 'a', action: 'bw', resources: { [name32]: 0, Z: 1 } }],
+    });
+    assert.equal(graph.limits['a-b_c'], 5);
+    assert.deepEqual(graph.nodes[0].resources, { [name32]: 0, Z: 1 });
+  });
+
+  test('a graph without declarations reports empty objects everywhere', async () => {
+    await writer('nw');
+    await service.putGraph('nolimit', { id: 'nolimit', nodes: [{ id: 'a', action: 'nw' }] });
+    const run = await service.runGraph('nolimit');
+    assert.deepEqual(run.resource_limits, {});
+    assert.deepEqual(run.peak_resources, {});
+    assert.deepEqual(run.nodes[0].resources, {});
+    const graph = await service.getGraph('nolimit');
+    assert.deepEqual(graph.limits, {});
+    assert.deepEqual(graph.nodes[0].resources, {});
+  });
+
+  test('GET returns limits and node resources; last_run keeps its shape', async () => {
+    await writer('gw');
+    await service.putGraph('getg', {
+      id: 'getg',
+      limits: { cpu: 2 },
+      nodes: [{ id: 'a', action: 'gw', resources: { cpu: 1 } }],
+    });
+    await service.runGraph('getg');
+    const graph = await service.getGraph('getg');
+    assert.deepEqual(graph.limits, { cpu: 2 });
+    assert.deepEqual(graph.nodes, [{ id: 'a', action: 'gw', needs: [], resources: { cpu: 1 } }]);
+    assert.deepEqual(
+      Object.keys(graph.last_run).sort(),
+      ['cache_hits', 'cache_misses', 'completed_at', 'duration_ms', 'nodes', 'peak_parallel', 'run_key'],
+    );
+    assert.deepEqual(Object.keys(graph.last_run.nodes[0]).sort(), ['action', 'cache', 'digest', 'id', 'key']);
+  });
+
+  test('resource declarations never reach keys, manifests or artifacts', async () => {
+    await writer('plain-act', 'same');
+    await service.putGraph('plain', { id: 'plain', concurrency: 2, nodes: [{ id: 'a', action: 'plain-act' }] });
+    await service.putGraph('decorated', {
+      id: 'decorated',
+      concurrency: 2,
+      limits: { cpu: 2 },
+      nodes: [{ id: 'a', action: 'plain-act', resources: { cpu: 1 } }],
+    });
+    const plain = await service.runGraph('plain');
+    const decorated = await service.runGraph('decorated');
+    assert.equal(decorated.run_key, plain.run_key);
+    assert.equal(decorated.nodes[0].key, plain.nodes[0].key);
+    assert.equal(decorated.cache_hits, 1, 'the resource declaration must not move the cache key');
+    const { manifest } = await service.cacheGet(plain.nodes[0].key);
+    assert.ok(!('resources' in manifest) && !('limits' in manifest));
+  });
+
+  test('quotas gate dispatch, a candidate that does not fit is skipped, and peaks are reported', async () => {
+    for (const name of ['ra', 'rb', 'rc']) await writer(name);
+    await service.putGraph('quota', {
+      id: 'quota',
+      concurrency: 3,
+      limits: { cpu: 1, mem: 4 },
+      nodes: [
+        { id: 'a', action: 'ra', resources: { cpu: 1 } },
+        { id: 'b', action: 'rb', resources: { cpu: 1 } },
+        { id: 'c', action: 'rc' },
+      ],
+    });
+    const run = await service.runGraph('quota');
+    assert.equal(run.cache_misses, 3);
+    assert.deepEqual(run.resource_limits, { cpu: 1, mem: 4 });
+    assert.deepEqual(run.peak_resources, { cpu: 1, mem: 0 }, 'declared but unused resources peak at 0');
+    assert.equal(run.peak_parallel, 2, 'b waits for a quota slot while c runs beside a');
+    const byId = Object.fromEntries(run.nodes.map((node) => [node.id, node]));
+    assert.deepEqual(byId.a.resources, { cpu: 1 });
+    assert.deepEqual(byId.c.resources, {});
+
+    const again = await service.runGraph('quota');
+    assert.equal(again.cache_hits, 3);
+    assert.deepEqual(again.peak_resources, run.peak_resources, 'hits reserve and release exactly like misses');
+  });
+
+  test('two nodes may share one quota up to its limit', async () => {
+    for (const name of ['sa', 'sb']) await writer(name);
+    await service.putGraph('shared', {
+      id: 'shared',
+      concurrency: 2,
+      limits: { cpu: 2 },
+      nodes: [
+        { id: 'a', action: 'sa', resources: { cpu: 1 } },
+        { id: 'b', action: 'sb', resources: { cpu: 1 } },
+      ],
+    });
+    const run = await service.runGraph('shared');
+    assert.equal(run.peak_parallel, 2);
+    assert.deepEqual(run.peak_resources, { cpu: 2 });
+  });
+
+  test('a failed node releases its reservation and its dependents never start', async () => {
+    const reader = await service.putAction({
+      name: 'reader',
+      command: { kind: 'copy-file', source: 'src/app.txt' },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    await service.putAction({
+      name: 'downstream',
+      command: { kind: 'write-file', content: 'downstream' },
+      inputs: [hashIn('in.txt', reader.key)],
+      env: [],
+      depends_on: ['reader'],
+    });
+    await service.putGraph('fails', {
+      id: 'fails',
+      concurrency: 2,
+      limits: { cpu: 1 },
+      nodes: [
+        { id: 'a', action: 'reader', resources: { cpu: 1 } },
+        { id: 'b', action: 'downstream', needs: ['a'] },
+      ],
+    });
+    await rm(path.join(workspace, 'src', 'app.txt'));
+    await assert.rejects(service.runGraph('fails'), (error) => error.code === 'action_failed');
+    assert.equal((await service.stats()).artifacts_executed, 0, 'the dependent node never started');
+  });
+
+  test('the CLI run prints the same resource fields without new flags', async () => {
+    await writer('cli-act');
+    await service.putGraph('cli-graph', {
+      id: 'cli-graph',
+      limits: { cpu: 1 },
+      nodes: [{ id: 'a', action: 'cli-act', resources: { cpu: 1 } }],
+    });
+    const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+    const exec = promisify(execFile);
+    const out = JSON.parse(
+      (await exec(process.execPath, [cli, 'run', '--graph', 'cli-graph', '--data', path.join(root, 'data'), '--workspace', workspace])).stdout,
+    );
+    assert.deepEqual(out.resource_limits, { cpu: 1 });
+    assert.deepEqual(out.peak_resources, { cpu: 1 });
+    assert.deepEqual(out.nodes[0].resources, { cpu: 1 });
+  });
+});
+
 describe('HTTP contract', () => {
   let base;
   let httpRoot;
@@ -820,6 +1007,35 @@ describe('HTTP contract', () => {
     assert.equal((await call('GET', `/cache/${acceptedKey}`)).text, 'remote artifact\n');
     assert.equal((await call('PUT', `/cache/${acceptedKey}`, content, upload)).status, 409);
     assert.equal((await call('GET', `/cache/${hex('d')}`)).status, 404);
+  });
+
+  test('graphs carry resource limits end to end', async () => {
+    const action = { name: 'res-filter', command: filterCmd(), inputs: [fileIn('src/app.txt')], env: ['LANG'] };
+    assert.equal((await call('POST', '/actions', action)).status, 201);
+    const created = await call('POST', '/graphs', {
+      id: 'res-build',
+      concurrency: 2,
+      limits: { cpu: 2 },
+      nodes: [{ id: 'compile', action: 'res-filter', resources: { cpu: 1 } }],
+    });
+    assert.equal(created.status, 201);
+    assert.deepEqual(created.json.limits, { cpu: 2 });
+    assert.deepEqual(created.json.nodes[0].resources, { cpu: 1 });
+
+    const rejected = await call('POST', '/graphs', {
+      id: 'res-bad',
+      nodes: [{ id: 'a', action: 'res-filter', resources: { gpu: 1 } }],
+    });
+    assert.deepEqual({ status: rejected.status, code: rejected.json.error.code }, { status: 400, code: 'validation_error' });
+    assert.equal((await call('GET', '/graphs/res-bad')).status, 404, 'a rejected graph is not stored');
+
+    const fetched = await call('GET', '/graphs/res-build');
+    assert.deepEqual(fetched.json.limits, { cpu: 2 });
+    assert.deepEqual(fetched.json.nodes[0].resources, { cpu: 1 });
+    const run = await call('POST', '/graphs/res-build/run', {});
+    assert.deepEqual(run.json.resource_limits, { cpu: 2 });
+    assert.deepEqual(run.json.peak_resources, { cpu: 1 });
+    assert.deepEqual(run.json.nodes[0].resources, { cpu: 1 });
   });
 
   test('POST /cache/gc keeps last-run entries and collects the rest', async () => {

@@ -188,8 +188,9 @@ and `POST /graphs` are idempotent under `Idempotency-Key`.
 {
   "id": "build",
   "concurrency": 2,
+  "limits": {"cpu": 2},
   "nodes": [
-    {"id": "filter", "action": "filter"},
+    {"id": "filter", "action": "filter", "resources": {"cpu": 1}},
     {"id": "bundle", "action": "bundle", "needs": ["filter"]}
   ]
 }
@@ -200,6 +201,16 @@ and `POST /graphs` are idempotent under `Idempotency-Key`.
 impossible and is reported as a validation error. `concurrency` defaults to `1`
 and must be an integer in `1..64`. `GET /graphs/{id}` adds `last_run` (or `null`).
 
+**Resource quotas.** `limits` (graph level) and `resources` (node level) are
+optional plain objects, both defaulting to `{}`. A resource name is 1–32
+characters: an ASCII letter followed by ASCII letters, digits, `_` or `-`.
+Limit values are integers in `1..1000000`, resource values integers in
+`0..1000000`, and every resource a node reserves must name a graph limit it
+does not exceed. A violation is a `400` and leaves the stored graph untouched.
+These declarations only gate **when** a node may start; they never enter the
+action key, node key, run key, manifest or artifact bytes, and quotas are
+independent across graphs.
+
 ### `POST /graphs/{id}/run`
 
 Body `{}` or `{"use_cache": false}`. Every run is scheduled, so each node's
@@ -209,21 +220,30 @@ Body `{}` or `{"use_cache": false}`. Every run is scheduled, so each node's
 {
   "cache_hits": 2, "cache_misses": 0, "graph_id": "build", "peak_parallel": 1,
   "plan_reused": true,
+  "resource_limits": {"cpu": 2}, "peak_resources": {"cpu": 1},
   "nodes": [
     {"action": "bundle", "cache": "hit", "dependencies": [{"action_id": "filter", "key": "e71afcbf…"}],
-     "digest": "sha256:1e6ed65d…", "id": "bundle", "key": "6bd590cb…", "size": 6},
+     "digest": "sha256:1e6ed65d…", "id": "bundle", "key": "6bd590cb…", "resources": {}, "size": 6},
     {"action": "filter", "cache": "hit", "dependencies": [],
-     "digest": "sha256:4fdbc441…", "id": "filter", "key": "e71afcbf…", "size": 17}
+     "digest": "sha256:4fdbc441…", "id": "filter", "key": "e71afcbf…", "resources": {"cpu": 1}, "size": 17}
   ],
   "run_key": "921010ee…", "stale_nodes": []
 }
 ```
 
 Nodes are dispatched in lexicographic id order, at most `concurrency` at a time,
-and never before every node they `needs` is `done`. `stale_nodes` lists nodes
-whose key moved since the previous run, and `run_key` hashes the resolved
-`(action_id, key)` pairs. With `use_cache: false` the answer is recomputed while
-the store is still written, which forces a miss without corrupting anything.
+and never before every node they `needs` is `done`. A ready node starts only
+when its `resources` also fit inside the graph's `limits` alongside whatever is
+already reserved; a candidate that does not fit is skipped for now, so it never
+blocks later ready nodes. Reservations are held for the whole node — cache hit
+or miss alike — and released the moment it completes or fails. The run response
+adds `resource_limits` (the graph's `limits`), `peak_resources` (the high-water
+mark of simultaneous reservations per declared limit, `0` when never used) and
+each node's `resources`; all three are empty objects when nothing is declared.
+`stale_nodes` lists nodes whose key moved since the previous run, and `run_key`
+hashes the resolved `(action_id, key)` pairs. With `use_cache: false` the answer
+is recomputed while the store is still written, which forces a miss without
+corrupting anything.
 
 ### `GET /stats`
 
