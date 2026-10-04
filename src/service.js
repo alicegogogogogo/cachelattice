@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { canonicalJson, digestOf, sha256Text, assertDigest } from './canonical.js';
@@ -29,6 +29,7 @@ export const MANIFEST_SCHEMA = 'cachelattice/manifest/v1';
 export const RUN_SCHEMA = 'cachelattice/run/v1';
 const VERIFY_SCHEMA = 'cachelattice/verify/v1';
 const STATS_SCHEMA = 'cachelattice/stats/v1';
+const AUDIT_SCHEMA = 'cachelattice/audit/v1';
 
 const GRAPH_FIELDS = ['id', 'nodes', 'concurrency', 'limits'];
 const NODE_FIELDS = ['id', 'action', 'needs', 'resources'];
@@ -37,6 +38,21 @@ const INPUT_FIELDS = ['kind', 'path', 'digest'];
 const CACHE_ENTRY_FIELDS = ['action_id', 'command', 'inputs', 'env', 'depends_on'];
 
 const HEX_KEY = /^[0-9a-f]{64}$/;
+const HEX_PREFIX = /^[0-9a-f]{2}$/;
+const DIGEST_FORMAT = /^sha256:[0-9a-f]{64}$/;
+const MANIFEST_FIELDS = [
+  'schema',
+  'key_schema',
+  'action_id',
+  'key',
+  'command',
+  'inputs',
+  'env',
+  'dependency_run_key',
+  'dependencies',
+  'digest',
+  'size',
+];
 const ZERO_DIGEST = `sha256:${'0'.repeat(64)}`;
 const RESOURCE_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
 const RESOURCE_MAX = 1000000;
@@ -109,6 +125,51 @@ export function dependencyRunKey(dependencies) {
 }
 
 const byNodeId = (left, right) => (left.node_id < right.node_id ? -1 : left.node_id > right.node_id ? 1 : 0);
+const byName = (left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+
+// Structural validation of a stored manifest: every field present with the
+// right type and no unknown fields. The digest's *format* is deliberately not
+// checked here - a malformed digest is its own audit finding
+// (manifest_invalid_digest), not a schema violation.
+function manifestShapeValid(manifest) {
+  if (!isPlainObject(manifest)) return false;
+  if (Object.keys(manifest).some((field) => !MANIFEST_FIELDS.includes(field))) return false;
+  if (manifest.schema !== MANIFEST_SCHEMA) return false;
+  if (manifest.key_schema !== KEY_SCHEMA) return false;
+  if (typeof manifest.action_id !== 'string' || manifest.action_id.length === 0) return false;
+  if (typeof manifest.key !== 'string' || !HEX_KEY.test(manifest.key)) return false;
+  if (!isPlainObject(manifest.command) || typeof manifest.command.kind !== 'string') return false;
+  if (!Array.isArray(manifest.inputs)) return false;
+  for (const input of manifest.inputs) {
+    if (!isPlainObject(input)) return false;
+    if (input.kind !== 'file' && input.kind !== 'hash') return false;
+    if (typeof input.path !== 'string' || typeof input.digest !== 'string') return false;
+  }
+  if (
+    !isPlainObject(manifest.env) ||
+    !Array.isArray(manifest.env.names) ||
+    !manifest.env.names.every((name) => typeof name === 'string') ||
+    !isPlainObject(manifest.env.values) ||
+    !Object.values(manifest.env.values).every((value) => typeof value === 'string')
+  ) {
+    return false;
+  }
+  if (typeof manifest.dependency_run_key !== 'string' || !HEX_KEY.test(manifest.dependency_run_key)) return false;
+  if (!Array.isArray(manifest.dependencies)) return false;
+  for (const dependency of manifest.dependencies) {
+    if (
+      !isPlainObject(dependency) ||
+      typeof dependency.action_id !== 'string' ||
+      typeof dependency.key !== 'string' ||
+      !HEX_KEY.test(dependency.key)
+    ) {
+      return false;
+    }
+  }
+  if (typeof manifest.digest !== 'string') return false;
+  if (!Number.isInteger(manifest.size) || manifest.size < 0) return false;
+  return true;
+}
 
 // A miss and a hit must produce byte-identical manifests as well as
 // byte-identical artifacts, so the manifest is derived purely from the action
@@ -1004,6 +1065,226 @@ export class Cachelattice {
       kept_bytes: keptBytes,
       removed_bytes: removedBytes,
     };
+  }
+
+  // ------------------------------------------------------------------ audit
+
+  // Read-only sweep of the entire object store. Every manifest and every blob
+  // is checked with no count limit, one corrupt object never stops the scan,
+  // and nothing is written: no blob, manifest, meta, idempotency record,
+  // statistic or workspace file changes, so the same store always yields the
+  // same report. Only manifests that pass every check count as healthy
+  // references; a blob no valid manifest references is an orphan.
+  async audit() {
+    await this.loading;
+    const issues = [];
+    const report = (code, path, message, extra = {}) => issues.push({ code, path, message, ...extra });
+    const referenced = new Set();
+
+    const manifestCount = await this.auditManifests(report, referenced);
+    const { blobCount, blobSizes } = await this.auditBlobs(report);
+
+    let referencedBytes = 0;
+    for (const hexDigest of referenced) referencedBytes += blobSizes.get(hexDigest) ?? 0;
+    let orphanBytes = 0;
+    for (const [hexDigest, size] of blobSizes) {
+      if (referenced.has(hexDigest)) continue;
+      orphanBytes += size;
+      const digest = `sha256:${hexDigest}`;
+      report(
+        'orphan_blob',
+        `blobs/sha256/${hexDigest.slice(0, 2)}/${hexDigest}`,
+        `blob ${digest} is not referenced by any valid cache manifest`,
+        { digest },
+      );
+    }
+
+    issues.sort((left, right) =>
+      left.path < right.path
+        ? -1
+        : left.path > right.path
+          ? 1
+          : left.code < right.code
+            ? -1
+            : left.code > right.code
+              ? 1
+              : 0,
+    );
+    return {
+      schema: AUDIT_SCHEMA,
+      healthy: issues.length === 0,
+      manifest_count: manifestCount,
+      blob_count: blobCount,
+      referenced_bytes: referencedBytes,
+      orphan_bytes: orphanBytes,
+      issues,
+    };
+  }
+
+  // Walks manifests/<k0k1>/<key>.json. A file at a well-formed manifest
+  // location is a recognized manifest and counted, whatever its contents turn
+  // out to be; anything else under the managed tree is an unexpected object.
+  async auditManifests(report, referenced) {
+    let count = 0;
+    const prefixes = await readdir(this.store.manifestRoot, { withFileTypes: true });
+    for (const prefix of prefixes.sort(byName)) {
+      const directory = `manifests/${prefix.name}`;
+      if (!prefix.isDirectory() || !HEX_PREFIX.test(prefix.name)) {
+        report('unexpected_object', directory, 'unexpected object in the manifest store');
+        continue;
+      }
+      const files = await readdir(path.join(this.store.manifestRoot, prefix.name), { withFileTypes: true });
+      for (const file of files.sort(byName)) {
+        const relative = `${directory}/${file.name}`;
+        const named = /^([0-9a-f]{64})\.json$/.exec(file.name);
+        if (!file.isFile() || named === null) {
+          report('unexpected_object', relative, 'unexpected object in the manifest store');
+          continue;
+        }
+        const key = named[1];
+        if (key.slice(0, 2) !== prefix.name) {
+          report('unexpected_object', relative, `manifest ${key} is stored under prefix ${prefix.name}`, { key });
+          continue;
+        }
+        count += 1;
+        await this.auditManifest(key, relative, report, referenced);
+      }
+    }
+    return count;
+  }
+
+  // The per-manifest cascade: each check only runs when the ones before it
+  // passed, because a manifest that fails one check cannot be trusted to
+  // interpret the next. A manifest reaches the end only when its path, JSON,
+  // schema, claimed key, recomputed address, digest format and referenced
+  // blob are all exactly what they claim to be.
+  async auditManifest(key, relative, report, referenced) {
+    let text;
+    try {
+      text = await readFile(this.store.manifestPath(key), 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') return; // vanished between listing and reading
+      throw error;
+    }
+    let manifest;
+    try {
+      manifest = JSON.parse(text);
+    } catch {
+      report('manifest_invalid_json', relative, `cache manifest for key ${key} is not valid JSON`, { key });
+      return;
+    }
+    if (!manifestShapeValid(manifest)) {
+      report(
+        'manifest_invalid_schema',
+        relative,
+        `cache manifest for key ${key} does not match ${MANIFEST_SCHEMA}`,
+        { key },
+      );
+      return;
+    }
+    if (manifest.key !== key) {
+      report('manifest_key_mismatch', relative, `cache manifest stored for key ${key} claims key ${manifest.key}`, {
+        key,
+      });
+      return;
+    }
+    let address = null;
+    try {
+      address = nodeKeyOf(
+        actionKey({ command: manifest.command, inputs: manifest.inputs, env: manifest.env }),
+        manifest.dependencies.map((dependency) => dependency.key),
+      );
+    } catch {
+      address = null;
+    }
+    if (address !== key) {
+      report('manifest_address_mismatch', relative, `cache manifest for key ${key} fails address validation`, {
+        key,
+      });
+      return;
+    }
+    if (!DIGEST_FORMAT.test(manifest.digest)) {
+      report('manifest_invalid_digest', relative, `cache manifest for key ${key} carries an invalid digest`, { key });
+      return;
+    }
+    const hexDigest = manifest.digest.slice('sha256:'.length);
+    let buffer;
+    try {
+      buffer = await readFile(this.store.blobPath(hexDigest));
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        report(
+          'blob_missing',
+          relative,
+          `cache manifest for key ${key} references a blob that is missing from the object store`,
+          { key, digest: manifest.digest },
+        );
+        return;
+      }
+      throw error;
+    }
+    let intact = true;
+    if (digestOf(buffer) !== manifest.digest) {
+      report(
+        'blob_digest_mismatch',
+        relative,
+        `blob referenced by cache manifest for key ${key} does not match its digest`,
+        { key, digest: manifest.digest },
+      );
+      intact = false;
+    }
+    if (buffer.length !== manifest.size) {
+      report(
+        'blob_size_mismatch',
+        relative,
+        `blob referenced by cache manifest for key ${key} is ${buffer.length} bytes, not the declared ${manifest.size}`,
+        { key, digest: manifest.digest },
+      );
+      intact = false;
+    }
+    if (intact) referenced.add(hexDigest);
+  }
+
+  // Walks blobs/sha256/<d0d1>/<digest-hex>. A file at a well-formed blob
+  // location is a recognized blob; anything else under blobs/ - a stranger
+  // file, a misnamed object, a digest stored under the wrong prefix - is an
+  // unexpected object and is neither counted nor treated as a reference.
+  async auditBlobs(report) {
+    let count = 0;
+    const sizes = new Map();
+    const algorithms = await readdir(path.join(this.store.root, 'blobs'), { withFileTypes: true });
+    for (const algorithm of algorithms.sort(byName)) {
+      const directory = `blobs/${algorithm.name}`;
+      if (!algorithm.isDirectory() || algorithm.name !== 'sha256') {
+        report('unexpected_object', directory, 'unexpected object in the blob store');
+        continue;
+      }
+      const prefixes = await readdir(this.store.blobRoot, { withFileTypes: true });
+      for (const prefix of prefixes.sort(byName)) {
+        const prefixDirectory = `${directory}/${prefix.name}`;
+        if (!prefix.isDirectory() || !HEX_PREFIX.test(prefix.name)) {
+          report('unexpected_object', prefixDirectory, 'unexpected object in the blob store');
+          continue;
+        }
+        const files = await readdir(path.join(this.store.blobRoot, prefix.name), { withFileTypes: true });
+        for (const file of files.sort(byName)) {
+          const relative = `${prefixDirectory}/${file.name}`;
+          if (!file.isFile() || !HEX_KEY.test(file.name)) {
+            report('unexpected_object', relative, 'unexpected object in the blob store');
+            continue;
+          }
+          if (file.name.slice(0, 2) !== prefix.name) {
+            report('unexpected_object', relative, `blob ${file.name} is stored under prefix ${prefix.name}`, {
+              digest: `sha256:${file.name}`,
+            });
+            continue;
+          }
+          count += 1;
+          sizes.set(file.name, (await stat(path.join(this.store.blobRoot, prefix.name, file.name))).size);
+        }
+      }
+    }
+    return { blobCount: count, blobSizes: sizes };
   }
 
   // ----------------------------------------------------------- idempotency

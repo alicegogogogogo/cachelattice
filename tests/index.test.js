@@ -926,6 +926,253 @@ describe('cache garbage collection', () => {
   });
 });
 
+describe('cache audit', () => {
+  const byPathThenCode = (left, right) =>
+    left.path < right.path
+      ? -1
+      : left.path > right.path
+        ? 1
+        : left.code < right.code
+          ? -1
+          : left.code > right.code
+            ? 1
+            : 0;
+
+  test('an empty store and a clean run both audit healthy', async () => {
+    assert.deepEqual(await service.audit(), {
+      schema: 'cachelattice/audit/v1',
+      healthy: true,
+      manifest_count: 0,
+      blob_count: 0,
+      referenced_bytes: 0,
+      orphan_bytes: 0,
+      issues: [],
+    });
+    await registerFilter();
+    const run = await runOne();
+    assert.deepEqual(await service.audit(), {
+      schema: 'cachelattice/audit/v1',
+      healthy: true,
+      manifest_count: 1,
+      blob_count: 1,
+      referenced_bytes: run.nodes[0].size,
+      orphan_bytes: 0,
+      issues: [],
+    });
+  });
+
+  test('orphan blobs and stranger objects are reported and left in place', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const orphan = await service.store.writeBlob(Buffer.from('orphan bytes'));
+    await writeFile(path.join(service.store.manifestRoot, 'notes.txt'), 'hello');
+    await mkdir(path.join(service.store.blobRoot, 'zz'), { recursive: true });
+
+    const report = await service.audit();
+    assert.equal(report.healthy, false);
+    assert.equal(report.manifest_count, 1);
+    assert.equal(report.blob_count, 2, 'the orphan is a recognized blob');
+    assert.equal(report.referenced_bytes, run.nodes[0].size);
+    assert.equal(report.orphan_bytes, Buffer.byteLength('orphan bytes'));
+    const summary = report.issues.map((issue) => [issue.code, issue.path]);
+    assert.deepEqual(
+      summary,
+      [
+        ['orphan_blob', `blobs/sha256/${orphan.slice(0, 2)}/${orphan}`],
+        ['unexpected_object', 'blobs/sha256/zz'],
+        ['unexpected_object', 'manifests/notes.txt'],
+      ].sort((left, right) => byPathThenCode({ code: left[0], path: left[1] }, { code: right[0], path: right[1] })),
+    );
+    const orphanIssue = report.issues.find((issue) => issue.code === 'orphan_blob');
+    assert.equal(orphanIssue.digest, `sha256:${orphan}`);
+    assert.equal(orphanIssue.key, undefined);
+    assert.ok(service.store.hasBlob(orphan), 'an audit never deletes anything');
+    assert.equal((await service.stats()).cache_entries, 1);
+  });
+
+  test('a misplaced manifest or blob is an unexpected object, not a counted entry', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const key = run.nodes[0].key;
+    const manifest = await readFile(service.store.manifestPath(key), 'utf8');
+    const wrongPrefix = key.slice(0, 2) === 'ab' ? 'cd' : 'ab';
+    await mkdir(path.join(service.store.manifestRoot, wrongPrefix), { recursive: true });
+    await writeFile(path.join(service.store.manifestRoot, wrongPrefix, `${key}.json`), manifest);
+    const digest = run.nodes[0].digest.slice('sha256:'.length);
+    const wrongBlobPrefix = digest.slice(0, 2) === 'ab' ? 'cd' : 'ab';
+    await mkdir(path.join(service.store.blobRoot, wrongBlobPrefix), { recursive: true });
+    await writeFile(path.join(service.store.blobRoot, wrongBlobPrefix, digest), 'misplaced');
+
+    const report = await service.audit();
+    assert.equal(report.manifest_count, 1, 'a misplaced manifest is not a recognized manifest');
+    assert.equal(report.blob_count, 1, 'a misplaced blob is not a recognized blob');
+    assert.deepEqual(
+      report.issues.map((issue) => ({ code: issue.code, path: issue.path, key: issue.key, digest: issue.digest })),
+      [
+        {
+          code: 'unexpected_object',
+          path: `blobs/sha256/${wrongBlobPrefix}/${digest}`,
+          key: undefined,
+          digest: `sha256:${digest}`,
+        },
+        {
+          code: 'unexpected_object',
+          path: `manifests/${wrongPrefix}/${key}.json`,
+          key,
+          digest: undefined,
+        },
+      ].sort(byPathThenCode),
+    );
+  });
+
+  test('every manifest corruption is reported under its own code and never stops the scan', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const key = run.nodes[0].key;
+    const manifestPath = service.store.manifestPath(key);
+    const relative = `manifests/${key.slice(0, 2)}/${key}.json`;
+    const original = await readFile(manifestPath, 'utf8');
+    const manifest = JSON.parse(original);
+    const blobPath = service.store.blobPath(run.nodes[0].digest.slice('sha256:'.length));
+    const blobBytes = await readFile(blobPath);
+
+    const expectIssue = async (mutate, code, pattern, restore = true) => {
+      await mutate();
+      const report = await service.audit();
+      const issue = report.issues.find((candidate) => candidate.code === code);
+      assert.ok(issue, `expected ${code} in ${JSON.stringify(report.issues)}`);
+      assert.equal(issue.path, relative);
+      assert.equal(issue.key, key);
+      assert.match(issue.message, pattern);
+      assert.equal(report.healthy, false);
+      assert.equal(report.manifest_count, 1, 'a corrupt manifest is still a recognized manifest');
+      if (restore) {
+        await writeFile(manifestPath, original);
+        await writeFile(blobPath, blobBytes);
+        assert.equal((await service.audit()).healthy, true, 'restoring the objects restores health');
+      }
+    };
+
+    await expectIssue(() => writeFile(manifestPath, 'this is not json'), 'manifest_invalid_json', /not valid JSON/);
+    await expectIssue(
+      () => writeFile(manifestPath, `${canonicalJson({ ...manifest, surprise: 1 })}\n`),
+      'manifest_invalid_schema',
+      /does not match/,
+    );
+    await expectIssue(
+      () => writeFile(manifestPath, `${canonicalJson({ ...manifest, key: hex('f') })}\n`),
+      'manifest_key_mismatch',
+      /claims key/,
+    );
+    await expectIssue(
+      () =>
+        writeFile(
+          manifestPath,
+          `${canonicalJson({ ...manifest, command: { kind: 'write-file', content: 'forged' } })}\n`,
+        ),
+      'manifest_address_mismatch',
+      /address validation/,
+    );
+    await expectIssue(
+      () => writeFile(manifestPath, `${canonicalJson({ ...manifest, digest: 'sha256:not-hex' })}\n`),
+      'manifest_invalid_digest',
+      /invalid digest/,
+    );
+    await expectIssue(() => service.store.deleteBlob(run.nodes[0].digest.slice('sha256:'.length)), 'blob_missing', /missing from the object store/);
+    await expectIssue(async () => {
+      await writeFile(manifestPath, original);
+      await writeFile(blobPath, 'tampered');
+    }, 'blob_digest_mismatch', /does not match its digest/);
+  });
+
+  test('a tampered blob reports digest and size mismatches at the manifest path', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const key = run.nodes[0].key;
+    const digest = run.nodes[0].digest;
+    const blobPath = service.store.blobPath(digest.slice('sha256:'.length));
+    const original = await readFile(blobPath);
+    await writeFile(blobPath, 'tampered-with');
+
+    const report = await service.audit();
+    const relative = `manifests/${key.slice(0, 2)}/${key}.json`;
+    const atPath = report.issues.filter((issue) => issue.path === relative);
+    assert.deepEqual(
+      atPath.map((issue) => issue.code),
+      ['blob_digest_mismatch', 'blob_size_mismatch'],
+      'issues at one path sort by code',
+    );
+    for (const issue of atPath) assert.equal(issue.digest, digest);
+    // The dishonest reference is not healthy, so the tampered blob is an orphan too.
+    assert.ok(
+      report.issues.some(
+        (issue) => issue.code === 'orphan_blob' && issue.path === `blobs/sha256/${digest.slice(7, 9)}/${digest.slice(7)}`,
+      ),
+    );
+    assert.equal(report.orphan_bytes, Buffer.byteLength('tampered-with'));
+    assert.equal(report.referenced_bytes, 0);
+
+    await writeFile(blobPath, original);
+    assert.equal((await service.audit()).healthy, true);
+  });
+
+  test('a corrupt manifest turns the blob it named into an orphan', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const key = run.nodes[0].key;
+    const digest = run.nodes[0].digest.slice('sha256:'.length);
+    await writeFile(service.store.manifestPath(key), 'not json');
+
+    const report = await service.audit();
+    assert.equal(report.manifest_count, 1);
+    assert.equal(report.blob_count, 1);
+    assert.equal(report.referenced_bytes, 0, 'an unparseable reference is not a healthy reference');
+    assert.equal(report.orphan_bytes, run.nodes[0].size);
+    assert.deepEqual(
+      report.issues.map((issue) => issue.code).sort(),
+      ['manifest_invalid_json', 'orphan_blob'],
+    );
+    assert.ok(report.issues.some((issue) => issue.code === 'orphan_blob' && issue.digest === `sha256:${digest}`));
+  });
+
+  test('issues sort by path and then by code', async () => {
+    await registerFilter();
+    const run = await runOne();
+    const orphan = await service.store.writeBlob(Buffer.from('orphan'));
+    await writeFile(service.store.manifestPath(run.nodes[0].key), 'not json');
+    await writeFile(path.join(service.store.manifestRoot, 'stray'), 'x');
+
+    const report = await service.audit();
+    assert.ok(report.issues.length >= 3);
+    assert.deepEqual(report.issues, [...report.issues].sort(byPathThenCode));
+    assert.ok(orphan.length === 64);
+  });
+
+  test('auditing writes nothing: stats, entries, blobs and meta are unchanged', async () => {
+    await registerFilter();
+    await runOne();
+    const beforeStats = await service.stats();
+    const beforeEntries = await service.cacheEntries(100000);
+    const beforeBlobs = await service.store.listBlobDigests();
+    const idempotencyDir = service.store.metaPath('idempotency');
+    const beforeIdempotency = await readdir(idempotencyDir).catch((error) =>
+      error.code === 'ENOENT' ? [] : Promise.reject(error),
+    );
+
+    const first = await service.audit();
+    const second = await service.audit();
+    assert.deepEqual(second, first, 'the same store always yields the same report');
+    assert.deepEqual(await service.stats(), beforeStats, 'no counter moves during an audit');
+    assert.deepEqual(await service.cacheEntries(100000), beforeEntries);
+    assert.deepEqual(await service.store.listBlobDigests(), beforeBlobs);
+    assert.deepEqual(
+      await readdir(idempotencyDir).catch((error) => (error.code === 'ENOENT' ? [] : Promise.reject(error))),
+      beforeIdempotency,
+      'no idempotency record is written',
+    );
+  });
+});
+
 describe('resource limits', () => {
   const writer = (name, content = name) =>
     service.putAction({ name, command: { kind: 'write-file', content }, inputs: [fileIn('src/app.txt')], env: [] });
@@ -1369,5 +1616,33 @@ describe('HTTP contract', () => {
     }
     assert.equal((await call('GET', `/cache/${remoteKey}`)).status, 404);
     assert.equal((await call('GET', `/cache/${keptKey}`)).status, 200);
+  });
+
+  test('POST /cache/audit sweeps the whole store and is strictly read-only', async () => {
+    const before = (await call('GET', '/stats')).json;
+    const audit = await call('POST', '/cache/audit', {});
+    assert.equal(audit.status, 200);
+    assert.equal(audit.json.schema, 'cachelattice/audit/v1');
+    assert.equal(audit.json.healthy, true);
+    assert.ok(audit.json.manifest_count > 0);
+    assert.ok(audit.json.blob_count > 0);
+    assert.ok(audit.json.referenced_bytes > 0);
+    assert.equal(audit.json.orphan_bytes, 0);
+    assert.deepEqual(audit.json.issues, []);
+
+    // An empty body is accepted just like {}, and the same store yields the
+    // same report.
+    assert.deepEqual((await call('POST', '/cache/audit')).json, audit.json);
+
+    // The request carries no parameters: anything but empty or {} is a 400.
+    for (const badBody of ['not json', '[]', 'null', '42', '"x"', { dry_run: true }, { extra: 1 }]) {
+      const bad = await call('POST', '/cache/audit', badBody);
+      assert.deepEqual(
+        { status: bad.status, code: bad.json.error.code },
+        { status: 400, code: 'validation_error' },
+        `body ${JSON.stringify(badBody)} is rejected`,
+      );
+    }
+    assert.deepEqual((await call('GET', '/stats')).json, before, 'auditing moves no counter');
   });
 });

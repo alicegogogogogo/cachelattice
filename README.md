@@ -343,6 +343,53 @@ removed_bytes}`; the key and digest arrays are sorted and duplicate-free,
 reference, and `removed_bytes` the total size of the distinct blobs deleted. A
 dry run reports the same sets and byte counts without deleting anything.
 
+### `POST /cache/audit`
+
+Body must be empty or exactly `{}`; any other JSON value, a non-object, or an
+unknown field is a `400` `validation_error`. The audit is strictly read-only:
+it never writes a blob, manifest, meta or idempotency record, never moves a
+statistic and never touches the workspace, and it is not part of idempotency
+replay.
+
+Every object under `blobs/sha256/` and `manifests/` is checked with no count
+limit, and one corrupt object never stops the scan. Each manifest is checked
+for location (path prefix matches its key), valid JSON and schema, a claimed
+key matching its filename, and a recomputed address — the action key from its
+frozen command, inputs and environment, folded with its dependency node keys —
+equal to its key; its digest and size formats must be valid, the referenced
+blob must exist, and the blob's actual SHA-256 and byte count must match the
+declaration. A blob no *valid* manifest references is an orphan; a stranger
+file or a misplaced object in the managed directories is unexpected. A
+reference that cannot be fully validated never counts as healthy.
+
+The scan always answers `200` with a `cachelattice/audit/v1` report:
+
+```json
+{
+  "schema": "cachelattice/audit/v1",
+  "healthy": false,
+  "manifest_count": 3,
+  "blob_count": 4,
+  "referenced_bytes": 51,
+  "orphan_bytes": 12,
+  "issues": [
+    {"code": "orphan_blob", "path": "blobs/sha256/4f/4fdbc441…",
+     "message": "blob sha256:4fdbc441… is not referenced by any valid cache manifest",
+     "digest": "sha256:4fdbc441…"}
+  ]
+}
+```
+
+`healthy` is `true` exactly when `issues` is empty. `manifest_count` and
+`blob_count` count the recognized objects; `referenced_bytes` and
+`orphan_bytes` sum distinct blobs. `issues` is sorted by `path` and then by
+`code`, and each issue carries `code`, `path` and `message`, plus `key` or
+`digest` when one can be credibly identified. The code is one of
+`unexpected_object`, `manifest_invalid_json`, `manifest_invalid_schema`,
+`manifest_key_mismatch`, `manifest_address_mismatch`,
+`manifest_invalid_digest`, `blob_missing`, `blob_digest_mismatch`,
+`blob_size_mismatch` or `orphan_blob`.
+
 `POST /graphs/{id}/run` also honours `Idempotency-Key`: the first response is
 persisted under `meta/idempotency/` and a repeat with that key returns the stored
 status and body without re-executing anything. Keys are scoped to the request
