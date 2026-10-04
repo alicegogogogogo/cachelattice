@@ -348,6 +348,51 @@ persisted under `meta/idempotency/` and a repeat with that key returns the store
 status and body without re-executing anything. Keys are scoped to the request
 target.
 
+### `POST /cache/audit`
+
+Body must be empty or exactly `{}`; any other JSON value, a non-object, an
+unknown field, or illegal JSON is a `400` `validation_error`. The audit is
+strictly read-only: it never writes a blob, manifest, meta entry, idempotency
+record or statistic, and it never touches the workspace. Unlike `POST /cache/gc`
+it does not fail on a corrupt object — a damaged object is one more finding and
+the scan continues, so a single failure never hides the rest of the pollution.
+
+Every managed object under `blobs/sha256` and `manifests` is enumerated without
+a limit. Each manifest is checked for its storage path matching its key, valid
+JSON, a valid schema, and that its command, inputs, environment and dependency
+node keys recompute to its action/node key; its `digest` and `size` must be well
+formed, the referenced blob must exist, and its actual SHA-256 and byte count
+must match the declaration. A blob not referenced by any valid manifest is an
+orphan; a strange file or a correctly named object in the wrong place is an
+unexpected object. `200` always:
+
+```json
+{
+  "schema": "cachelattice/audit/v1",
+  "healthy": false,
+  "manifest_count": 3,
+  "blob_count": 4,
+  "referenced_bytes": 42,
+  "orphan_bytes": 12,
+  "issues": [
+    {"code": "orphan_blob", "path": "blobs/sha256/62/6286…", "message": "…",
+     "digest": "sha256:6286…"}
+  ]
+}
+```
+
+`healthy` is true exactly when `issues` is empty. `manifest_count` and
+`blob_count` count every recognized object, `referenced_bytes` and
+`orphan_bytes`
+sum distinct blob sizes (bytes shared by several manifests count once), and
+`issues` are sorted by `path` then `code`. Each issue carries `code`, `path` and
+`message`, plus `key` and/or `digest` whenever they can be identified
+confidently. The codes are `unexpected_object`, `manifest_invalid_json`,
+`manifest_invalid_schema`, `manifest_key_mismatch`, `manifest_address_mismatch`,
+`manifest_invalid_digest`, `blob_missing`, `blob_digest_mismatch`,
+`blob_size_mismatch` and `orphan_blob`. An unresolvable reference never counts
+as a healthy one, so the blob it names (if any) is reported as an orphan.
+
 ## CLI
 
 ```bash

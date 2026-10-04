@@ -926,6 +926,256 @@ describe('cache garbage collection', () => {
   });
 });
 
+describe('whole-store audit', () => {
+  // Relative paths every audit uses, independent of the per-test temp root.
+  const manifestRel = (key) => `manifests/${key.slice(0, 2)}/${key}.json`;
+  const blobRel = (digest) => `blobs/sha256/${digest.slice(0, 2)}/${digest}`;
+  const byCode = (report) => Object.fromEntries(report.issues.map((issue) => [issue.code, issue]));
+  const codes = (report) => report.issues.map((issue) => issue.code).sort();
+
+  const seedClean = async () => {
+    await registerFilter();
+    const run = await runOne();
+    return run.nodes[0];
+  };
+
+  test('a clean store is healthy and counts the managed objects', async () => {
+    const node = await seedClean();
+    const report = await service.audit();
+    assert.deepEqual(report, {
+      schema: 'cachelattice/audit/v1',
+      healthy: true,
+      manifest_count: 1,
+      blob_count: 1,
+      referenced_bytes: node.size,
+      orphan_bytes: 0,
+      issues: [],
+    });
+  });
+
+  test('an unreferenced blob is an orphan carrying its digest, and shared bytes count once', async () => {
+    const node = await seedClean();
+    const orphanDigest = await service.store.writeBlob(Buffer.from('orphan bytes'));
+    const report = await service.audit();
+    assert.equal(report.healthy, false);
+    assert.equal(report.manifest_count, 1);
+    assert.equal(report.blob_count, 2);
+    assert.equal(report.referenced_bytes, node.size);
+    assert.equal(report.orphan_bytes, Buffer.byteLength('orphan bytes'));
+    assert.deepEqual(codes(report), ['orphan_blob']);
+    const orphan = byCode(report).orphan_blob;
+    assert.equal(orphan.path, blobRel(orphanDigest));
+    assert.equal(orphan.digest, `sha256:${orphanDigest}`);
+    assert.equal(orphan.key, undefined);
+
+    // A second healthy manifest naming the very same blob must not double-count
+    // its bytes.
+    const content = 'shared\n';
+    const kept = await service.putAction({
+      name: 'kept',
+      command: { kind: 'write-file', content },
+      inputs: [fileIn('src/app.txt')],
+      env: [],
+    });
+    const twin = await service.putAction({
+      name: 'twin',
+      command: { kind: 'write-file', content },
+      inputs: [fileIn('src/app.txt'), hashIn('seed.bin', hex('e'))],
+      env: [],
+    });
+    await service.putGraph('g', { id: 'g', nodes: [{ id: 'a', action: 'kept' }] });
+    await service.runGraph('g');
+    await service.cachePut(
+      twin.key,
+      {
+        action_id: 'peer',
+        command: { kind: 'write-file', content },
+        inputs: [
+          fileWith('src/app.txt', twin.inputs.find((i) => i.path === 'src/app.txt').digest),
+          hashIn('seed.bin', hex('e')),
+        ],
+        env: [],
+      },
+      Buffer.from(content),
+    );
+    const shared = await service.audit();
+    assert.equal(shared.referenced_bytes, node.size + Buffer.byteLength(content));
+  });
+
+  test('every manifest defect is reported without stopping the rest of the scan', async () => {
+    const node = await seedClean();
+    const goodKey = node.key;
+    const goodManifest = await service.store.readManifest(goodKey);
+
+    // Creates an address-valid remote manifest at its own genuine key, so that
+    // mutating only its digest/size reaches the digest stage rather than
+    // tripping the address check first.
+    const seedRemoteManifest = async (name, content) => {
+      const action = await service.putAction({
+        name,
+        command: { kind: 'write-file', content },
+        inputs: [fileIn('src/app.txt')],
+        env: [],
+      });
+      await service.cachePut(
+        action.key,
+        {
+          action_id: 'peer',
+          command: { kind: 'write-file', content },
+          inputs: [fileWith('src/app.txt', action.inputs[0].digest)],
+          env: [],
+        },
+        Buffer.from(content),
+      );
+      return { key: action.key, manifest: await service.store.readManifest(action.key) };
+    };
+
+    // Invalid JSON.
+    const badJsonKey = hex('b');
+    await mkdir(path.dirname(service.store.manifestPath(badJsonKey)), { recursive: true });
+    await writeFile(service.store.manifestPath(badJsonKey), 'this is not json');
+
+    // Invalid schema (an unknown field, otherwise parseable).
+    const badSchemaKey = hex('c');
+    await service.store.writeManifest(badSchemaKey, { ...goodManifest, key: badSchemaKey, surprise: 1 });
+
+    // Key mismatch: stored under dddd… but claims aaaa….
+    const mismatchKey = hex('d');
+    await service.store.writeManifest(mismatchKey, { ...goodManifest, key: hex('a') });
+
+    // Address mismatch on the otherwise-good entry: changing the command moves
+    // the action key away from the storage key.
+    await service.store.writeManifest(goodKey, {
+      ...goodManifest,
+      command: { ...goodManifest.command, pattern: 'ZZZ' },
+    });
+
+    // Malformed digest declaration on an otherwise address-valid manifest.
+    const badDigest = await seedRemoteManifest('remote-bad-digest', 'bad digest format\n');
+    await service.store.writeManifest(badDigest.key, { ...badDigest.manifest, digest: 'sha256:not-hex' });
+
+    // Well-formed digest that names an absent blob (address stays valid because
+    // the digest is not part of the key).
+    const missing = await seedRemoteManifest('remote-missing', 'missing blob\n');
+    await service.store.writeManifest(missing.key, {
+      ...missing.manifest,
+      digest: `sha256:${hex('1')}`,
+      size: 9,
+    });
+
+    const report = await service.audit();
+    assert.equal(report.healthy, false);
+    // The tampered original plus five planted damaged manifests = 6.
+    assert.equal(report.manifest_count, 6);
+    const found = byCode(report);
+    assert.equal(found.manifest_invalid_json.path, manifestRel(badJsonKey));
+    assert.equal(found.manifest_invalid_json.key, badJsonKey);
+    assert.equal(found.manifest_invalid_schema.path, manifestRel(badSchemaKey));
+    assert.equal(found.manifest_key_mismatch.path, manifestRel(mismatchKey));
+    assert.equal(found.manifest_key_mismatch.key, hex('a'));
+    assert.equal(found.manifest_address_mismatch.path, manifestRel(goodKey));
+    assert.equal(found.manifest_address_mismatch.key, goodKey);
+    assert.equal(found.manifest_invalid_digest.path, manifestRel(badDigest.key));
+    assert.equal(found.blob_missing.path, manifestRel(missing.key));
+    assert.equal(found.blob_missing.digest, `sha256:${hex('1')}`);
+    // The original good blob is no longer referenced by a valid manifest once
+    // its own manifest fails address validation, so it surfaces as an orphan;
+    // the missing-blob and bad-digest entries reference no healthy blob.
+    for (const issue of report.issues) {
+      assert.equal(typeof issue.code, 'string');
+      assert.equal(typeof issue.path, 'string');
+      assert.match(issue.message, /./);
+    }
+  });
+
+  test('digest and size tampering of a referenced blob are flagged, not double-counted as orphans', async () => {
+    const node = await seedClean();
+    const digestHex = node.digest.slice('sha256:'.length);
+
+    await writeFile(service.store.blobPath(digestHex), 'tampered bytes here');
+    let report = await service.audit();
+    assert.deepEqual(codes(report), ['blob_digest_mismatch']);
+    assert.equal(byCode(report).blob_digest_mismatch.key, node.key);
+    assert.equal(byCode(report).blob_digest_mismatch.digest, node.digest);
+
+    // Restore the bytes, then lie only about the size.
+    await service.store.deleteBlob(digestHex);
+    await service.store.writeBlob(Buffer.from('alpha\nbeta\ngamma\n'));
+    const manifest = await service.store.readManifest(node.key);
+    await service.store.writeManifest(node.key, { ...manifest, size: manifest.size + 5 });
+    report = await service.audit();
+    assert.deepEqual(codes(report), ['blob_size_mismatch']);
+    assert.equal(byCode(report).blob_size_mismatch.digest, node.digest);
+  });
+
+  test('strange files and misplaced objects are unexpected objects', async () => {
+    await seedClean();
+    const strayBlob = path.join(service.store.blobRoot, 'stranger.txt');
+    const strayManifest = path.join(service.store.manifestRoot, 'notes.json');
+    await writeFile(strayBlob, 'hi');
+    await writeFile(strayManifest, '{}');
+
+    // A well-named digest parked under the wrong two-digit prefix.
+    const parked = await service.store.writeBlob(Buffer.from('parked'));
+    const wrongPrefix = parked.slice(0, 2) === 'ab' ? 'cd' : 'ab';
+    await mkdir(path.join(service.store.blobRoot, wrongPrefix), { recursive: true });
+    await writeFile(path.join(service.store.blobRoot, wrongPrefix, parked), 'parked');
+    // A non-hex name inside a valid prefix.
+    await writeFile(path.join(service.store.blobRoot, 'ab', 'not-hex'), 'x');
+    // Nested one level too deep.
+    await mkdir(path.join(service.store.blobRoot, 'ab', 'cd'), { recursive: true });
+    await writeFile(path.join(service.store.blobRoot, 'ab', 'cd', parked), 'x');
+
+    const report = await service.audit();
+    const unexpected = report.issues.filter((issue) => issue.code === 'unexpected_object');
+    const unexpectedPaths = unexpected.map((issue) => issue.path).sort();
+    assert.ok(unexpectedPaths.includes('blobs/sha256/stranger.txt'));
+    assert.ok(unexpectedPaths.includes('manifests/notes.json'));
+    assert.ok(unexpectedPaths.includes(`blobs/sha256/${wrongPrefix}/${parked}`));
+    assert.ok(unexpectedPaths.includes('blobs/sha256/ab/not-hex'));
+    assert.ok(unexpectedPaths.includes(`blobs/sha256/ab/cd/${parked}`));
+  });
+
+  test('issues are sorted by path then code, and the walk has no object limit', async () => {
+    await seedClean();
+    const many = [];
+    for (let i = 0; i < 250; i += 1) {
+      many.push(await service.store.writeBlob(Buffer.from(`orphan number ${i}\n`)));
+    }
+    const report = await service.audit();
+    assert.equal(report.blob_count, many.length + 1, 'every blob is enumerated despite the volume');
+    assert.equal(report.issues.length, many.length);
+    const paths = report.issues.map((issue) => issue.path);
+    const sorted = [...paths].sort();
+    assert.deepEqual(paths, sorted, 'issues are ordered by path');
+    // path, then code ordering.
+    const keys = report.issues.map((issue) => `${issue.path}\u0000${issue.code}`);
+    assert.deepEqual(keys, [...keys].sort());
+  });
+
+  test('audit is strictly read-only: bytes, stats and idempotency records are untouched', async () => {
+    const node = await seedClean();
+    await service.store.writeBlob(Buffer.from('an orphan to report'));
+    const snapshot = async () => {
+      const files = new Map();
+      for (const root of [service.store.blobRoot, service.store.manifestRoot, service.store.metaRoot]) {
+        for (const rel of await service.store.collectRelativeFiles(root)) {
+          files.set(path.relative(service.store.root, path.join(root, rel)), await readFile(path.join(root, rel)));
+        }
+      }
+      return files;
+    };
+    const before = await snapshot();
+    const statsBefore = JSON.stringify(await service.stats());
+    const first = await service.audit();
+    const second = await service.audit();
+    assert.deepEqual(second, first, 'repeated audits return the same summary');
+    assert.deepEqual(await snapshot(), before, 'no file under the data directory changed');
+    assert.equal(JSON.stringify(await service.stats()), statsBefore, 'no statistic moved');
+    assert.equal(node.key, (await runOne()).nodes[0].key, 'the cache still serves its entry');
+  });
+});
+
 describe('resource limits', () => {
   const writer = (name, content = name) =>
     service.putAction({ name, command: { kind: 'write-file', content }, inputs: [fileIn('src/app.txt')], env: [] });
@@ -1369,5 +1619,62 @@ describe('HTTP contract', () => {
     }
     assert.equal((await call('GET', `/cache/${remoteKey}`)).status, 404);
     assert.equal((await call('GET', `/cache/${keptKey}`)).status, 200);
+  });
+
+  test('POST /cache/audit reports the whole store and rejects every non-empty non-{} body', async () => {
+    const action = { name: 'audit-filter', command: filterCmd(), inputs: [fileIn('src/app.txt')], env: ['LANG'] };
+    assert.equal((await call('POST', '/actions', action)).status, 201);
+    assert.equal((await call('POST', '/graphs', { id: 'audit-build', nodes: [{ id: 'a', action: 'audit-filter' }] })).status, 201);
+    const run = await call('POST', '/graphs/audit-build/run', {});
+    const keptKey = run.json.nodes[0].key;
+
+    const empty = await call('POST', '/cache/audit');
+    assert.equal(empty.status, 200);
+    assert.equal(empty.json.schema, 'cachelattice/audit/v1');
+    assert.equal(empty.json.healthy, true, 'the shared HTTP store has no prior corruption');
+    assert.deepEqual(empty.json.issues, []);
+    assert.ok(empty.json.manifest_count >= 1);
+    assert.ok(empty.json.referenced_bytes >= run.json.nodes[0].size);
+    const baseline = {
+      manifest_count: empty.json.manifest_count,
+      blob_count: empty.json.blob_count,
+      referenced_bytes: empty.json.referenced_bytes,
+    };
+
+    // {} is the only non-empty accepted body and matches the empty-body result.
+    assert.deepEqual((await call('POST', '/cache/audit', {})).json, empty.json);
+
+    for (const badBody of ['not json', '[]', 'null', '42', '"x"', '{', { dry_run: true }, { extra: 1 }]) {
+      const bad = await call('POST', '/cache/audit', badBody);
+      assert.deepEqual(
+        { status: bad.status, code: bad.json.error.code },
+        { status: 400, code: 'validation_error' },
+        `body ${JSON.stringify(badBody)} is rejected`,
+      );
+    }
+
+    // An orphan blob makes the report unhealthy and names it, without changing
+    // any counter.
+    const statsBefore = (await call('GET', '/stats')).json;
+    const orphanContent = Buffer.from('http orphan\n');
+    const orphanDigest = digestOf(orphanContent).slice('sha256:'.length);
+    const dataRoot = path.join(httpRoot, 'data', 'blobs', 'sha256', orphanDigest.slice(0, 2));
+    await mkdir(dataRoot, { recursive: true });
+    await writeFile(path.join(dataRoot, orphanDigest), orphanContent);
+
+    const dirty = await call('POST', '/cache/audit', {});
+    assert.equal(dirty.status, 200);
+    assert.equal(dirty.json.healthy, false);
+    assert.equal(dirty.json.manifest_count, baseline.manifest_count);
+    assert.equal(dirty.json.blob_count, baseline.blob_count + 1);
+    assert.equal(dirty.json.referenced_bytes, baseline.referenced_bytes);
+    assert.equal(dirty.json.orphan_bytes, orphanContent.length);
+    const orphanIssue = dirty.json.issues.find((issue) => issue.code === 'orphan_blob');
+    assert.equal(orphanIssue.digest, digestOf(orphanContent));
+    assert.deepEqual(dirty.json.issues.map((i) => i.path), [...dirty.json.issues.map((i) => i.path)].sort());
+
+    const statsAfter = (await call('GET', '/stats')).json;
+    assert.deepEqual(statsAfter, statsBefore, 'audit never moves a statistic');
+    assert.equal((await call('GET', `/cache/${keptKey}`)).status, 200, 'audit deletes nothing');
   });
 });

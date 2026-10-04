@@ -6,6 +6,7 @@ import { canonicalJson, digestOf } from './canonical.js';
 import { NotFoundError, ValidationError } from './errors.js';
 
 const HEX = /^[0-9a-f]{64}$/;
+const HEX_PREFIX = /^[0-9a-f]{2}$/;
 
 function assertHex(value, label) {
   if (typeof value !== 'string' || !HEX.test(value)) {
@@ -145,20 +146,73 @@ export class ObjectStore {
   // hex digest is not a cache object and is left alone.
   async listBlobDigests() {
     const digests = [];
-    let prefixes;
-    try {
-      prefixes = await readdir(this.blobRoot, { withFileTypes: true });
-    } catch (error) {
-      if (error.code === 'ENOENT') return digests;
-      throw error;
-    }
-    for (const prefix of prefixes.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()) {
-      const files = await readdir(path.join(this.blobRoot, prefix));
-      for (const file of files.sort()) {
-        if (HEX.test(file)) digests.push(file);
-      }
+    for (const blob of await this.listBlobFiles()) {
+      if (blob.digest !== null) digests.push(blob.digest);
     }
     return digests;
+  }
+
+  // Recursively collects every regular file below `directory`, as a POSIX
+  // path relative to that directory. Directories of any depth are followed so
+  // that misplaced objects and strange files cannot hide outside the expected
+  // two-level layout; there is no result limit.
+  async collectRelativeFiles(directory, prefix = '') {
+    const files = [];
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === 'ENOENT') return files;
+      throw error;
+    }
+    entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    for (const entry of entries) {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        for (const nested of await this.collectRelativeFiles(absolute, rel)) files.push(nested);
+      } else {
+        // Every non-directory entry is reported; anything that is not named
+        // like a managed object is classified as an unexpected object by the
+        // caller, so a stray symlink cannot hide from the audit.
+        files.push(rel);
+      }
+    }
+    return files;
+  }
+
+  // Classifies every file below manifests/: a managed manifest must sit at
+  // <2-hex>/<64-hex>.json and its prefix must match its key. Anything else
+  // (strange files, wrongly named prefixes, misplaced or malformed names) is
+  // reported with key === null so the audit can call it an unexpected object.
+  async listManifestFiles() {
+    const out = [];
+    for (const rel of await this.collectRelativeFiles(this.manifestRoot)) {
+      const parts = rel.split('/');
+      let key = null;
+      if (parts.length === 2 && HEX_PREFIX.test(parts[0]) && parts[1].endsWith('.json')) {
+        const candidate = parts[1].slice(0, -'.json'.length);
+        if (HEX.test(candidate) && candidate.startsWith(parts[0])) key = candidate;
+      }
+      out.push({ key, rel: `manifests/${rel}`, absolute: path.join(this.manifestRoot, rel) });
+    }
+    return out;
+  }
+
+  // Classifies every file below blobs/sha256/: a managed blob must sit at
+  // <2-hex>/<64-hex> with the prefix equal to the first two digits of the
+  // digest naming it.
+  async listBlobFiles() {
+    const out = [];
+    for (const rel of await this.collectRelativeFiles(this.blobRoot)) {
+      const parts = rel.split('/');
+      let digest = null;
+      if (parts.length === 2 && HEX_PREFIX.test(parts[0]) && HEX.test(parts[1]) && parts[1].startsWith(parts[0])) {
+        digest = parts[1];
+      }
+      out.push({ digest, rel: `blobs/sha256/${rel}`, absolute: path.join(this.blobRoot, rel) });
+    }
+    return out;
   }
 
   async deleteManifest(key) {

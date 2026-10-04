@@ -204,6 +204,19 @@ async function route_request(service, request, url, segments, idempotencyKey) {
     const body = raw.length === 0 ? {} : parseJson(raw);
     return jsonOut(200, await service.gc(body));
   }
+  if (method === 'POST' && segments.length === 2 && segments[0] === 'cache' && segments[1] === 'audit') {
+    // Like verify, audit takes no parameters: the body is empty or exactly {},
+    // so a typo in a field name can never be silently ignored. The audit is
+    // strictly read-only and never participates in idempotency replay.
+    const raw = await readBody(request);
+    if (raw.length > 0) {
+      const parsed = parseJson(raw);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).length > 0) {
+        throw new ValidationError('audit request body must be empty or {}');
+      }
+    }
+    return jsonOut(200, await service.audit());
+  }
   if ((method === 'PUT' || method === 'POST') && segments.length === 2 && segments[0] === 'cache') {
     const key = assertCacheKey(segments[1]);
     const buffer = await readBody(request);

@@ -1,8 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
-import { canonicalJson, digestOf, sha256Text, assertDigest } from './canonical.js';
-import {
+import { canonicalJson, digestOf, sha256Text, assertDigest } from './canonical.js';import {
   CachelatticeError,
   ConflictError,
   NotFoundError,
@@ -28,6 +27,7 @@ import { ObjectStore } from './store.js';
 export const MANIFEST_SCHEMA = 'cachelattice/manifest/v1';
 export const RUN_SCHEMA = 'cachelattice/run/v1';
 const VERIFY_SCHEMA = 'cachelattice/verify/v1';
+const AUDIT_SCHEMA = 'cachelattice/audit/v1';
 const STATS_SCHEMA = 'cachelattice/stats/v1';
 
 const GRAPH_FIELDS = ['id', 'nodes', 'concurrency', 'limits'];
@@ -129,6 +129,121 @@ export function buildManifest({ actionId, key, command, inputs, env, dependencie
     digest: `sha256:${digest}`,
     size,
   };
+}
+
+const MANIFEST_FIELDS = [
+  'schema',
+  'key_schema',
+  'action_id',
+  'key',
+  'command',
+  'inputs',
+  'env',
+  'dependency_run_key',
+  'dependencies',
+  'digest',
+  'size',
+];
+
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// Structural validation of a stored manifest, mirroring buildManifest's output.
+// Returns a human-readable reason when the document cannot be a manifest, and
+// null when it is structurally sound. The digest/size *format* check is left to
+// the audit's manifest_invalid_digest stage, which owns that code.
+function validateManifestSchema(manifest) {
+  if (!isPlainObject(manifest)) return 'manifest must be a JSON object';
+  const fields = Object.keys(manifest);
+  for (const field of fields) {
+    if (!MANIFEST_FIELDS.includes(field)) return `manifest contains an unknown field: ${field}`;
+  }
+  for (const field of MANIFEST_FIELDS) {
+    if (!(field in manifest)) return `manifest is missing the ${field} field`;
+  }
+  if (manifest.schema !== MANIFEST_SCHEMA) return `manifest schema must be ${MANIFEST_SCHEMA}`;
+  if (manifest.key_schema !== KEY_SCHEMA) return `manifest key_schema must be ${KEY_SCHEMA}`;
+  if (typeof manifest.action_id !== 'string' || manifest.action_id.length === 0) {
+    return 'manifest action_id must be a non-empty string';
+  }
+  if (typeof manifest.key !== 'string' || !HEX_KEY.test(manifest.key)) {
+    return 'manifest key must be 64 lowercase hex characters';
+  }
+  if (typeof manifest.dependency_run_key !== 'string' || !HEX_KEY.test(manifest.dependency_run_key)) {
+    return 'manifest dependency_run_key must be 64 lowercase hex characters';
+  }
+  if (!isPlainObject(manifest.command)) return 'manifest command must be an object';
+  if (typeof manifest.command.kind !== 'string') return 'manifest command must carry a string kind';
+  // A stored command is already normalized, so re-normalizing is idempotent for
+  // a genuine manifest and rejects an unknown kind or a malformed command shape
+  // as a schema failure (rather than letting it hash to a bogus address).
+  try {
+    normalizeCommand(manifest.command);
+  } catch (error) {
+    return `manifest command is not valid: ${error.message}`;
+  }
+
+  if (!Array.isArray(manifest.inputs)) return 'manifest inputs must be an array';
+  for (const input of manifest.inputs) {
+    if (!isPlainObject(input)) return 'manifest inputs must be objects';
+    for (const field of Object.keys(input)) {
+      if (!INPUT_FIELDS.includes(field)) return `manifest input contains an unknown field: ${field}`;
+    }
+    if (input.kind !== 'file' && input.kind !== 'hash') {
+      return 'manifest input kind must be "file" or "hash"';
+    }
+    if (typeof input.path !== 'string' || input.path.length === 0) {
+      return 'manifest input path must be a non-empty string';
+    }
+    if (typeof input.digest !== 'string') return 'manifest input digest must be a string';
+    const digestPattern = input.kind === 'file' ? /^sha256:[0-9a-f]{64}$/ : HEX_KEY;
+    if (!digestPattern.test(input.digest)) {
+      return `manifest ${input.kind} input ${input.path} carries a malformed digest`;
+    }
+  }
+
+  if (!isPlainObject(manifest.env)) return 'manifest env must be an object';
+  if (!Array.isArray(manifest.env.names) || !isPlainObject(manifest.env.values)) {
+    return 'manifest env must carry a names array and a values object';
+  }
+  const envNames = manifest.env.names;
+  if (new Set(envNames).size !== envNames.length) return 'manifest env names must be unique';
+  for (const name of envNames) {
+    if (typeof name !== 'string' || !ENV_NAME.test(name)) {
+      return `manifest env names an invalid variable: ${JSON.stringify(name)}`;
+    }
+    if (typeof manifest.env.values[name] !== 'string') {
+      return `manifest env value for ${name} must be a string`;
+    }
+  }
+  for (const name of Object.keys(manifest.env.values)) {
+    if (!envNames.includes(name)) return `manifest env value for ${name} has no matching name`;
+  }
+
+  if (!Array.isArray(manifest.dependencies)) return 'manifest dependencies must be an array';
+  const dependencyActions = new Set();
+  for (const dependency of manifest.dependencies) {
+    if (!isPlainObject(dependency)) return 'manifest dependencies must be objects';
+    const dependencyFields = ['action_id', 'key'];
+    for (const field of Object.keys(dependency)) {
+      if (!dependencyFields.includes(field)) return `manifest dependency contains an unknown field: ${field}`;
+    }
+    if (typeof dependency.action_id !== 'string' || dependency.action_id.length === 0) {
+      return 'manifest dependency action_id must be a non-empty string';
+    }
+    if (dependencyActions.has(dependency.action_id)) {
+      return `manifest lists dependency ${dependency.action_id} twice`;
+    }
+    dependencyActions.add(dependency.action_id);
+    if (typeof dependency.key !== 'string' || !HEX_KEY.test(dependency.key)) {
+      return `manifest dependency ${dependency.action_id} key must be 64 lowercase hex characters`;
+    }
+  }
+
+  // digest and size presence is guaranteed by the required-field check above;
+  // their *format* is owned by the audit's manifest_invalid_digest stage (the
+  // only code that covers a malformed digest or size), so wrong types do not
+  // count as a schema failure here.
+  return null;
 }
 
 // Deterministic synthetic execution cost, so a graph run has the same shape on
@@ -1003,6 +1118,229 @@ export class Cachelattice {
       removed_digests: removedDigests.map((hexDigest) => `sha256:${hexDigest}`),
       kept_bytes: keptBytes,
       removed_bytes: removedBytes,
+    };
+  }
+
+  // ------------------------------------------------------------------- audit
+
+  // Whole-store, strictly read-only inspection. Unlike gc it never aborts on a
+  // corrupt object: every managed object is examined independently and every
+  // defect becomes an entry in `issues`. It walks blobs/sha256 and manifests
+  // without a limit, and writes nothing - no blob, manifest, meta entry,
+  // idempotency record, statistic or workspace file changes.
+  async audit() {
+    await this.loading;
+    const issues = [];
+    const addIssue = (code, file, message, identity = {}) => {
+      const issue = { code, path: file.rel, message };
+      if (identity.key !== undefined) issue.key = identity.key;
+      if (identity.digest !== undefined) issue.digest = identity.digest;
+      issues.push(issue);
+    };
+
+    // ---- manifests ---------------------------------------------------------
+    let manifestCount = 0;
+    // Blob digests named by a manifest that got far enough to be a real cache
+    // entry (valid location, JSON, schema, key and address, and a well-formed
+    // digest). Such a blob is *referenced* even when the bytes themselves are
+    // missing or tampered, so a corrupt blob is reported once instead of being
+    // mislabeled an orphan as well.
+    const resolvedReferences = new Set();
+    // Subset whose blob exists and whose digest and size check out: only these
+    // feed referenced_bytes. An unresolvable reference is never healthy.
+    const healthyReferences = new Set();
+
+    for (const file of await this.store.listManifestFiles()) {
+      const key = file.key;
+      if (key === null) {
+        // A strange file or a misplaced object is not recognized as a manifest,
+        // so it does not contribute to manifest_count.
+        addIssue(
+          'unexpected_object',
+          file,
+          'file is not a managed manifest (expected manifests/<2-hex>/<64-hex>.json with a matching prefix)',
+        );
+        continue;
+      }
+      manifestCount += 1;
+
+      let text;
+      try {
+        text = await readFile(file.absolute, 'utf8');
+      } catch (error) {
+        addIssue('unexpected_object', file, `manifest could not be read: ${error.message}`, { key });
+        continue;
+      }
+      let manifest;
+      try {
+        manifest = JSON.parse(text);
+      } catch {
+        addIssue('manifest_invalid_json', file, 'manifest is not valid JSON', { key });
+        continue;
+      }
+
+      const schemaError = validateManifestSchema(manifest);
+      if (schemaError) {
+        addIssue('manifest_invalid_schema', file, schemaError, {
+          key: typeof manifest?.key === 'string' ? manifest.key : key,
+        });
+        continue;
+      }
+      if (manifest.key !== key) {
+        addIssue('manifest_key_mismatch', file, `manifest key ${manifest.key} does not match its storage path (key ${key})`, {
+          key: manifest.key,
+        });
+        continue;
+      }
+
+      // Recompute the action key from command, inputs and environment, and the
+      // node key by folding in the dependency node keys; both must equal the
+      // manifest key. An unresolvable reference (an unnormalizable command,
+      // input or dependency) makes the address unverifiable and is never a
+      // healthy reference.
+      let address;
+      try {
+        address = nodeKeyOf(
+          actionKey({ command: manifest.command, inputs: manifest.inputs, env: manifest.env }),
+          manifest.dependencies.map((dependency) => dependency.key),
+        );
+      } catch {
+        address = null;
+      }
+      if (address !== key) {
+        addIssue(
+          'manifest_address_mismatch',
+          file,
+          'manifest command, inputs, environment and dependencies do not recompute to its key',
+          { key },
+        );
+        continue;
+      }
+
+      // The digest must be well formed before it can name a referenced blob.
+      const declaredDigest = manifest.digest;
+      let hexDigest;
+      try {
+        hexDigest = assertDigest(declaredDigest, 'manifest digest').slice('sha256:'.length);
+      } catch {
+        addIssue('manifest_invalid_digest', file, `manifest digest is not valid: ${String(declaredDigest)}`, { key });
+        continue;
+      }
+      // From here the reference is resolvable: the named blob is referenced
+      // and must not be classified as an orphan even if the bytes are bad.
+      resolvedReferences.add(hexDigest);
+
+      if (!Number.isInteger(manifest.size) || manifest.size < 0) {
+        addIssue(
+          'manifest_invalid_digest',
+          file,
+          `manifest size must be a non-negative integer, received ${JSON.stringify(manifest.size)}`,
+          { key, digest: declaredDigest },
+        );
+        continue;
+      }
+
+      const blobFile = this.store.blobPath(hexDigest);
+      let buffer;
+      try {
+        buffer = await readFile(blobFile);
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          addIssue('blob_missing', file, `manifest references blob sha256:${hexDigest}, which is absent`, {
+            key,
+            digest: declaredDigest,
+          });
+        } else {
+          addIssue('blob_missing', file, `referenced blob could not be read: ${error.message}`, {
+            key,
+            digest: declaredDigest,
+          });
+        }
+        continue;
+      }
+      const actualDigest = digestOf(buffer);
+      if (actualDigest !== declaredDigest) {
+        addIssue(
+          'blob_digest_mismatch',
+          file,
+          `referenced blob has digest ${actualDigest} but the manifest declares ${declaredDigest}`,
+          { key, digest: declaredDigest },
+        );
+        continue;
+      }
+      if (buffer.length !== manifest.size) {
+        addIssue(
+          'blob_size_mismatch',
+          file,
+          `referenced blob is ${buffer.length} bytes but the manifest declares ${manifest.size}`,
+          { key, digest: declaredDigest },
+        );
+        continue;
+      }
+
+      // Address, digest and size all check out: this is the only kind of
+      // reference that counts toward referenced_bytes.
+      healthyReferences.add(hexDigest);
+    }
+
+    // ---- blobs -------------------------------------------------------------
+    let blobCount = 0;
+    const blobFiles = new Map();
+    for (const file of await this.store.listBlobFiles()) {
+      if (file.digest === null) {
+        // Not named like a managed blob: classified, not counted.
+        addIssue(
+          'unexpected_object',
+          file,
+          'file is not a managed blob (expected blobs/sha256/<2-hex>/<64-hex> with a matching prefix)',
+        );
+        continue;
+      }
+      blobCount += 1;
+      blobFiles.set(file.digest, file);
+    }
+
+    // Healthy blob sizes, de-duplicated by digest.
+    let referencedBytes = 0;
+    for (const hexDigest of healthyReferences) {
+      referencedBytes += (await stat(blobFiles.get(hexDigest).absolute)).size;
+    }
+
+    // A blob with no resolvable reference is an orphan, regardless of whether
+    // its own bytes happen to hash to its name; a referenced-but-bad blob is
+    // already reported against its manifest above.
+    let orphanBytes = 0;
+    const orphanDigests = [...blobFiles.keys()]
+      .filter((hexDigest) => !resolvedReferences.has(hexDigest))
+      .sort();
+    for (const hexDigest of orphanDigests) {
+      const file = blobFiles.get(hexDigest);
+      const declared = `sha256:${hexDigest}`;
+      orphanBytes += (await stat(file.absolute)).size;
+      addIssue('orphan_blob', file, 'blob is not referenced by any valid manifest', { digest: declared });
+    }
+
+    // path first, then code, for a stable and diffable report.
+    issues.sort((left, right) =>
+      left.path < right.path
+        ? -1
+        : left.path > right.path
+          ? 1
+          : left.code < right.code
+            ? -1
+            : left.code > right.code
+              ? 1
+              : 0,
+    );
+
+    return {
+      schema: AUDIT_SCHEMA,
+      healthy: issues.length === 0,
+      manifest_count: manifestCount,
+      blob_count: blobCount,
+      referenced_bytes: referencedBytes,
+      orphan_bytes: orphanBytes,
+      issues,
     };
   }
 
